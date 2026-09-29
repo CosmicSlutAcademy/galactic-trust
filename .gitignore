@@ -1,0 +1,16 @@
+# Foundry build artifacts
+out/
+cache/
+broadcast/
+
+# Dependencies — restore with the commands in SESSION.md §3
+lib/
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+*.swp
