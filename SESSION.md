@@ -3,8 +3,8 @@
 
 **Last updated:** 2026-09-29
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
-**Location:** `~/galactic-trust` (~885 lines Solidity)
-**Status:** attester slashing built, 36/36 tests green, NOT deployed, NOT audited
+**Location:** `~/galactic-trust` (~1090 lines Solidity)
+**Status:** challenge bonds + curator panel + bounded settlement, 47/47 tests green, NOT deployed, NOT audited
 
 ---
 
@@ -14,15 +14,17 @@
 |---|---|
 | Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **needs PATH export, see §3** |
 | `GalacticTrust.sol` | ✅ compiles, quorum attestation + challenge window + slashing |
-| Test suite | ✅ 36/36 passing |
+| Test suite | ✅ 47/47 passing |
 | Deploy script | ✅ written, untested against a live RPC |
-| Attester bonds + attester slashing | ✅ built and tested (§4) |
+| Attester bonds + attester slashing | ✅ built and tested |
+| Challenge bonds | ✅ built — required to challenge, forfeited if rejected |
+| Weighted curator panel | ✅ built — `onlyOwner` ruling replaced |
+| Bounded settlement loops | ✅ `MAX_SIGNERS`/`MAX_CHALLENGERS` caps + pull payments |
 | Access-gating / query fees (pillar 2) | ❌ not built — separate contract |
 | Real ZK verifier | ❌ `IVerifier` hook only, no circom verifier wired |
-| Challenge bonds | ⚠️ challengers are now *rewarded* on a upheld dispute, but pay nothing to challenge |
-| Single-curator `resolveDispute` | ❌ still one owner key rules every dispute |
+| Curator identity/sybil control | ❌ weight is set by owner, no stake behind a curatorship |
 | Audit | ❌ none |
-| Git repo | ❌ **not initialised** — see §6 |
+| Git remote | ❌ local-only history, single disk — see §6 |
 | Mainnet/testnet deploy | ❌ none |
 
 ---
@@ -56,7 +58,7 @@ slashable, not eliminated. This is the honest version of the design.
 ```bash
 export PATH="$HOME/.foundry/bin:$PATH"   # REQUIRED — foundry is not on PATH by default
 cd ~/galactic-trust
-forge test          # 36/36
+forge test          # 47/47
 forge build
 ```
 
@@ -93,16 +95,18 @@ Pinned versions this was built and tested against:
 ```
 registerAttester()   → fundAttesterBond()      (bond required before signing)
 submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
-  ├─ signAttestation()   ×N attesters, weight accumulates
-  ├─ challengeAttestation() ×N challengers, accumulates
-  └─ after window:
-       ├─ zero challenges + quorum met → finalizeAttestation() → stake returned + reward minted
-       └─ one or more challenges → resolveDispute() (owner)
-              ├─ uphold=true  → SLASHED:
-              │      submitter stake burned
-              │      EVERY signing attester's bond burned   ← attester slashing
-              │      unburned remainder → challengers
-              └─ uphold=false → challenges cleared, returns to PENDING, can finalize
+  ├─ signAttestation()   ×N attesters, weight accumulates      (capped at MAX_SIGNERS)
+  ├─ challengeAttestation() ×N challengers, accumulates       (bond required, capped)
+  └─ after window closes:
+       ├─ zero challenges + quorum → finalizeAttestation() → stake returned + reward minted
+       └─ challenges stand → curator panel votes → tallyDispute() once quorum reached
+              ├─ uphold majority → _penalise():
+              │      submitter stake burned (slashBps)
+              │      every signing attester's bond burned
+              │      pool = unburned remainder + forfeited challenge bonds
+              │      challengers PULL their share via claimChallengeReward()
+              └─ reject majority → _forfeitChallengeBonds() burns challengers' bonds,
+                                     attestation returns to PENDING and can finalize
 ```
 
 ### Key properties
@@ -112,14 +116,17 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
 - **Quorum is basis-points of total attester weight** (`quorumBps`, default 50%), not a fixed
   N. Scales from a 5-node testnet to a committee without a rewrite.
 - **Challenges accumulate, they do not escalate.** This was a deliberate fix — see §5.
+- **Challenges are bonded.** A challenger must hold `challengeBondAmount` to file. If curators
+  reject the challenge the bond is burned, so frivolous challenging has a price.
+- **Curators vote by weight; no single key decides.** A ruling needs curator quorum
+  (`curatorQuorumWeight()`, also quorumBps) AND a non-tie. A split stalls rather than guessing.
 - **Attesters must bond to sign, and cannot withdraw while active.** Prevents bond → certify
   → withdraw before a dispute resolves.
 - **Attesters who sign a fabrication lose their bond.** This closes the colluding-quorum hole:
   previously a quorum could certify a lie, the submitter was punished, and the signers were free.
-- **Challengers are compensated** from the unburned remainder of the submitter's stake, so
-  enforcing accuracy is now rewarded rather than pure cost. Set `slashBps = 10000` for full burn.
-- `resolveDispute` requires the window to be **closed**; a curator cannot prematurely clear
-  a challenge slate.
+- **Settlement cost is bounded.** `MAX_SIGNERS` / `MAX_CHALLENGERS` (50 each) cap the loops;
+  challenger payouts are pull-based so a large challenger set cannot make settlement
+  unspendable. `_penalise` remains O(signers).
 - Owner is expected to be a `TimelockController` with `admin = address(0)`.
 - `Ownable2Step` — `transferOwnership` alone leaves one key in control until accepted.
 
@@ -150,6 +157,20 @@ Getters: `challengeCount`, `signerWeight`, `attesterBond`, `requiredQuorumWeight
 
 ## 5. Hard-won lessons / gotchas
 
+- **Anyone could drain the challenge payout pool.** `claimChallengeReward` checked only
+  `hasClaimed`, and `_penalise` had already `_clear`ed the challenger list, so the *first*
+  caller to invoke it took the whole pool. Caught by `test_RevertWhen_NonChallengerClaims`.
+  Fixed with a persistent `wasChallenger` mapping that survives the array clear, checked
+  before the claim. **Do not gate payouts on the transient array.**
+
+- **A rejected dispute stranded the challenger's bond** — neither returned nor slashed, just
+  locked in the contract forever, which left challenging free and so kept the griefing vector
+  open. Fixed with `_forfeitChallengeBonds`.
+
+- **A single `onlyOwner` curator could slash honest attesters.** Replaced with a weighted
+  panel: `castCuratorVote` + `tallyDispute`, needing quorum and a non-tie. Note the weight
+  is still assigned by the owner, so this decentralises the *ruling* but not the *appointment*.
+
 - **A colluding quorum was free.** The original design slashed only the *submitter* of a
   fabricated attestation. The attesters who actually certified the lie lost nothing — they could
   sign garbage indefinitely, letting someone else eat the penalty. Fixed with per-attester bonds
@@ -159,16 +180,23 @@ Getters: `challengeCount`, `signerWeight`, `attesterBond`, `requiredQuorumWeight
 - **A single challenger could freeze any attestation.** v1 flipped status to `DISPUTED` on the
   first challenge, so any random address could block finalization until the owner manually
   resolved — a protocol-wide griefing vector from a one-wallet attacker. Fixed by letting
-  challenges accumulate; escalation is now a quorum event. `test_ChallengeDoesNotFreezeSignatures`
-  guards it. **Do not reintroduce single-challenger escalation.**
+  challenges accumulate; escalation is now a curator-quorum event.
+  `test_ChallengeDoesNotFreezeSignatures` guards it. **Do not reintroduce single-challenger
+  escalation.**
 
 - **`delete` does not work on a local storage pointer to a dynamic array** (`delete ch` where
   `ch` is `address[] storage` → compile error 9767). Use a `pop()` loop helper, `_clear`.
 
+- **I declared an event param as `address indexed id` when the argument was `bytes32`.** The
+  error pointed at the *call site*, not the declaration, and renaming the event just moved the
+  caret. When solc complains that a `bytes32` arg needs an `address`, check the event
+  *declaration* before the call.
+
 - **`_penalise` burns tokens the contract holds**, so the contract must actually hold the full
-  attester bonds. Test setup funds attesters by transferring from the treasury — there is
-  deliberately no `mintForTest`. Adding one would leave an unguarded mint in a live token.
-  Assert on `BOND * n` components, not the raw `balanceOf(address(this))`.
+  attester and challenge bonds. Test setup funds them by transferring from the treasury —
+  there is deliberately no `mintForTest`. Adding one would leave an unguarded mint in a live
+  token. Assert on the `BOND`/`CHALLENGE_BOND` components, not raw `balanceOf(address(this))`,
+  since the held total changes whenever you add a new bond type.
 
 - **Foundry `vm.expectRevert(bytes4)` requires EXACT revert data in the current version**, not a
   selector prefix. Use `abi.encodeWithSelector(...)` or `vm.expectPartialRevert(...)`.
@@ -203,15 +231,15 @@ Getters: `challengeCount`, `signerWeight`, `attesterBond`, `requiredQuorumWeight
 
 ## 6. Next actions, in order
 
-1. ☐ **`git init` + commit.** Currently no VCS. Everything is unversioned on disk.
-2. ☐ **Challenge bonds.** Challengers are now rewarded when right, but pay *nothing* to
-   challenge. Free challenges are still a spam/DoS vector against the curator. Bond them.
-3. ☐ Replace the single `onlyOwner` curator in `resolveDispute` with a **stake-weighted
-   ruling** — this is now the main centralisation point in the whole contract.
-4. ☐ Build **pillar 2**: access-gating + query fees. Separate contract, reads GLT.
-5. ☐ Add a **circom verifier** implementing `IVerifier` for real confidential evidence.
-6. ☐ **Bound the `_penalise` loops.** They iterate signers and challengers unbounded. Fine for
-   a small committee, but a cap or pull-payment pattern is needed before mainnet.
+1. ☐ **Add a git remote.** History is local-only, so the whole project dies with the laptop —
+   the exact failure `~/bounty/SESSION.md` opens with.
+2. ☐ **Put stake behind a curatorship.** Curator weight is assigned by the owner and costs
+   nothing, so the panel is decentralised in *ruling* but not in *appointment*.
+3. ☐ **Build pillar 2**: access-gating + query fees. Separate contract, reads GLT.
+4. ☐ Add a **circom verifier** implementing `IVerifier` for real confidential evidence.
+5. ☐ **Invariant + fuzz tests.** Cap the signer/challenger arrays, and fuzz `_penalise` for
+   conservation of GLT (tokens in == burned + escrowed + returned).
+6. ☐ Replace the boilerplate `README.md` (still the Foundry template).
 7. ☐ Test deploy script against a local Anvil node, then a testnet.
 8. ☐ External audit **before** any mainnet deploy with real value.
 

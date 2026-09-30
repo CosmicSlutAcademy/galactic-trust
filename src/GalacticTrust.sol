@@ -67,6 +67,17 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     error BondBelowRequired(uint256 have, uint256 need);
     error AttesterStillActive(address account);
     error NoBondToWithdraw();
+    error NotCurator(address account);
+    error CuratorInactive(address account);
+    error AlreadyVoted(bytes32 id, address curator);
+    error CuratorVoteTooEarly(bytes32 id);
+    error CuratorQuorumNotReached(bytes32 id, uint256 have, uint256 need);
+    error CuratorsSplit(bytes32 id, uint256 upholdWeight, uint256 rejectWeight);
+    error TooManySigners(bytes32 id);
+    error TooManyChallengers(bytes32 id);
+    error ClaimAlreadyMade(bytes32 id, address account);
+    error NothingToClaim(bytes32 id, address account);
+    error NotAChallenger(bytes32 id, address account);
     event AttesterRegistered(address indexed account, uint128 weight);
     event AttesterWeightUpdated(address indexed account, uint128 weight);
     event AttesterDeactivated(address indexed account);
@@ -86,11 +97,22 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     event ChallengerRewarded(bytes32 indexed id, address indexed challenger, uint256 amount);
     event AttesterBondFunded(address indexed account, uint256 amount);
     event AttesterBondWithdrawn(address indexed account, uint256 amount);
+    event CuratorRegistered(address indexed account, uint128 weight);
+    event CuratorDeactivated(address indexed account);
+    event CuratorVoted(bytes32 indexed id, address indexed curator, bool uphold, uint128 weight);
+    event Disputed(bytes32 indexed id, uint256 upholdWeight, uint256 rejectWeight);
+    event ChallengeRewardClaimed(bytes32 indexed id, address indexed account, uint256 amount);
+    event PoolSeeded(bytes32 indexed id, uint256 each, uint256 challengers);
+    event ChallengerBondForfeited(bytes32 indexed id, address indexed challenger, uint256 amount);
     event SecretRevealed(bytes32 indexed id, bytes32 contentHash, bool valid);
     event VerifierSet(address indexed verifier);
 
     uint128 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant CHALLENGE_WINDOW = 2 days;
+
+    /// @dev Hard caps so settlement cost is bounded regardless of committee size.
+    uint256 public constant MAX_SIGNERS = 50;
+    uint256 public constant MAX_CHALLENGERS = 50;
 
     IVerifier public verifier;
     uint256 public quorumBps = 5_000;
@@ -109,11 +131,28 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     mapping(bytes32 => address[]) public signers;
     mapping(address => uint256) public attesterBond;
     mapping(bytes32 => bool) public disputeUpheld;
+    mapping(address => Attester) private _curators;
+    mapping(bytes32 => mapping(address => bool)) public curatorVote;
+    mapping(bytes32 => uint128) public upholdWeight;
+    mapping(bytes32 => uint128) public rejectWeight;
+    mapping(bytes32 => mapping(address => bool)) public hasClaimed;
+    mapping(bytes32 => mapping(address => bool)) public wasChallenger;
+    uint256 public totalCuratorWeight;
+    uint256 public challengeBondAmount;
+    mapping(address => uint256) public challengeBond;
+    mapping(bytes32 => uint256) public payoutPool;
 
     modifier onlyAttester() {
         Attester storage a = _attesters[msg.sender];
         if (a.account == address(0)) revert NotAttester(msg.sender);
         if (!a.active) revert AttesterInactive(msg.sender);
+        _;
+    }
+
+    modifier onlyCurator() {
+        Attester storage c = _curators[msg.sender];
+        if (c.account == address(0)) revert NotCurator(msg.sender);
+        if (!c.active) revert CuratorInactive(msg.sender);
         _;
     }
 
@@ -187,6 +226,59 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         attesterBond[msg.sender] = 0;
         _update(address(this), msg.sender, amount);
         emit AttesterBondWithdrawn(msg.sender, amount);
+    }
+
+    // ---------- curators ----------
+
+    function registerCurator(address account, uint128 weight) external onlyOwner {
+        if (account == address(0)) revert ZeroAddress();
+        Attester storage c = _curators[account];
+        if (c.account == address(0)) {
+            c.account = account;
+            c.active = true;
+            c.weight = weight;
+            totalCuratorWeight += weight;
+        } else {
+            totalCuratorWeight = totalCuratorWeight - c.weight + weight;
+            c.weight = weight;
+            c.active = true;
+        }
+        emit CuratorRegistered(account, weight);
+    }
+
+    function deactivateCurator(address account) external onlyOwner {
+        Attester storage c = _curators[account];
+        totalCuratorWeight -= c.weight;
+        c.active = false;
+        c.weight = 0;
+        emit CuratorDeactivated(account);
+    }
+
+    function curator(address account) external view returns (Attester memory) {
+        return _curators[account];
+    }
+
+    function curatorQuorumWeight() public view returns (uint256) {
+        return (totalCuratorWeight * quorumBps) / BPS_DENOMINATOR;
+    }
+
+    /// @notice Deposits GLT that is forfeited if a challenge turns out to be frivolous.
+    function fundChallengeBond(uint256 amount) external nonReentrant {
+        uint256 bal = balanceOf(msg.sender);
+        if (bal < amount) revert InsufficientStake(bal, amount);
+        _update(msg.sender, address(this), amount);
+        challengeBond[msg.sender] += amount;
+    }
+
+    function setChallengeBondAmount(uint256 amount) external onlyOwner {
+        challengeBondAmount = amount;
+    }
+
+    function withdrawChallengeBond() external nonReentrant {
+        uint256 amount = challengeBond[msg.sender];
+        if (amount == 0) revert NoBondToWithdraw();
+        challengeBond[msg.sender] = 0;
+        _update(address(this), msg.sender, amount);
     }
 
     function registerAttester(address account, uint128 weight) external onlyOwner {
@@ -273,6 +365,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (bond < attesterBondAmount)
             revert BondBelowRequired(bond, attesterBondAmount);
         Attester storage a = _attesters[msg.sender];
+        if (signers[id].length >= MAX_SIGNERS) revert TooManySigners(id);
         hasSigned[id][msg.sender] = true;
         signers[id].push(msg.sender);
         att.attestationWeight += a.weight;
@@ -301,24 +394,73 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (att.status != AttestationStatus.PENDING) revert AttestationNotPending(id);
         if (block.timestamp > att.challengeDeadline) revert ChallengeWindowClosed(id);
         if (hasChallenged[id][msg.sender]) revert AlreadyChallenged(id, msg.sender);
+        if (challengers[id].length >= MAX_CHALLENGERS) revert TooManyChallengers(id);
+        uint256 bond = challengeBond[msg.sender];
+        if (bond < challengeBondAmount)
+            revert BondBelowRequired(bond, challengeBondAmount);
         hasChallenged[id][msg.sender] = true;
+        wasChallenger[id][msg.sender] = true;
         challengers[id].push(msg.sender);
         emit AttestationChallenged(id, msg.sender, reason);
     }
 
-    /// @notice Curator ruling, only after the window closes. Upheld disputes burn the stake;
-    /// rejected disputes clear the challenge slate and release the attestation for finalization.
-    function resolveDispute(bytes32 id, bool uphold) external onlyOwner {
+    /// @notice Records a curator's ruling. Replaces a single owner key with a weighted panel:
+    /// an honest attestation can no longer be slashed by one compromised wallet.
+    function castCuratorVote(bytes32 id, bool uphold) external onlyCurator {
         Attestation storage att = _attestations[id];
         if (att.status != AttestationStatus.PENDING) revert NotPendingOrDisputed(id);
-        if (block.timestamp <= att.challengeDeadline) revert ChallengeWindowOpen(id);
+        if (block.timestamp <= att.challengeDeadline) revert CuratorVoteTooEarly(id);
         if (challengers[id].length == 0) revert NoChallengesToResolve(id);
-        disputeUpheld[id] = uphold;
+        if (curatorVote[id][msg.sender]) revert AlreadyVoted(id, msg.sender);
+        Attester storage c = _curators[msg.sender];
+        curatorVote[id][msg.sender] = true;
         if (uphold) {
+            upholdWeight[id] += c.weight;
+        } else {
+            rejectWeight[id] += c.weight;
+        }
+        emit CuratorVoted(id, msg.sender, uphold, c.weight);
+    }
+
+    /// @notice Applies the ruling once curator quorum is reached. Weight must not be tied,
+    /// otherwise the dispute stalls and funds sit locked indefinitely.
+    function tallyDispute(bytes32 id) external nonReentrant {
+        Attestation storage att = _attestations[id];
+        if (att.status != AttestationStatus.PENDING) revert NotPendingOrDisputed(id);
+        if (block.timestamp <= att.challengeDeadline) revert CuratorVoteTooEarly(id);
+        if (challengers[id].length == 0) revert NoChallengesToResolve(id);
+        uint256 up = upholdWeight[id];
+        uint256 down = rejectWeight[id];
+        if (up + down < curatorQuorumWeight())
+            revert CuratorQuorumNotReached(id, up + down, curatorQuorumWeight());
+        if (up == down) revert CuratorsSplit(id, up, down);
+        disputeUpheld[id] = up > down;
+        emit Disputed(id, up, down);
+        if (up > down) {
             _penalise(id, att);
         } else {
+            _forfeitChallengeBonds(id);
             _clear(challengers[id]);
             emit DisputeResolved(id, false);
+        }
+    }
+
+    /// @dev Burns the bond of every challenger when the challenge is thrown out. Without this
+    /// leg a rejected challenge leaves the bond locked in the contract forever, and challenging
+    /// stays free — which is exactly the griefing vector the bond exists to close.
+    function _forfeitChallengeBonds(bytes32 id) internal {
+        address[] storage ch = challengers[id];
+        for (uint256 i = 0; i < ch.length;) {
+            address c = ch[i];
+            uint256 amount = challengeBond[c];
+            if (amount > 0) {
+                challengeBond[c] = 0;
+                _burn(address(this), amount);
+                emit ChallengerBondForfeited(id, c, amount);
+            }
+            unchecked {
+                ++i;
+            }
         }
     }
 
@@ -329,8 +471,11 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     }
 
     /// @dev Burns the submitter's stake, slashes every attester who certified the fabrication,
-    /// and pays the unburned remainder to the challengers who caught it. Without the attester
-    /// leg a colluding quorum signs a lie, the submitter is punished, and the signers are free.
+    /// and escrows the unburned remainder plus forfeited challenge bonds for challengers to
+    /// pull. Without the attester leg a colluding quorum signs a lie, the submitter is
+    /// punished, and the signers are free. Settlement is deliberately O(signers) only:
+    /// challenger payouts are pull-based so the transaction cost cannot be inflated by
+    /// spamming challenges.
     function _penalise(bytes32 id, Attestation storage att) internal {
         uint256 burn = (att.stake * slashBps) / BPS_DENOMINATOR;
         uint256 remainder = att.stake - burn;
@@ -354,18 +499,42 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             }
         }
 
+        // Forfeited bonds from challengers whose dispute lost, added to the payout pool.
+        uint256 forfeited;
         address[] storage ch = challengers[id];
-        if (remainder > 0 && ch.length > 0) {
-            uint256 share = remainder / ch.length;
-            for (uint256 i = 0; i < ch.length;) {
-                _update(address(this), ch[i], share);
-                emit ChallengerRewarded(id, ch[i], share);
-                unchecked {
-                    ++i;
-                }
+        uint256 n = ch.length;
+        for (uint256 i = 0; i < n;) {
+            forfeited += challengeBond[ch[i]];
+            unchecked {
+                ++i;
             }
         }
+        uint256 pool = remainder + forfeited;
+        uint256 totalChallengers = n;
+        uint256 each = n > 0 ? pool / n : 0;
+        payoutPool[id] = each;
+        for (uint256 i = 0; i < n;) {
+            challengeBond[ch[i]] = 0;
+            unchecked {
+                ++i;
+            }
+        }
+        emit PoolSeeded(id, each, totalChallengers);
         _clear(ch);
+    }
+
+    /// @notice Pulls a challenger's share of the settlement pool. Pull-based so a large
+    /// challenger set cannot make settlement unspendable.
+    function claimChallengeReward(bytes32 id) external nonReentrant {
+        if (!wasChallenger[id][msg.sender]) revert NotAChallenger(id, msg.sender);
+        if (hasClaimed[id][msg.sender]) revert ClaimAlreadyMade(id, msg.sender);
+        if (disputeUpheld[id] != true) revert NothingToClaim(id, msg.sender);
+        uint256 amount = payoutPool[id];
+        if (amount == 0) revert NothingToClaim(id, msg.sender);
+        hasClaimed[id][msg.sender] = true;
+        payoutPool[id] = 0;
+        _update(address(this), msg.sender, amount);
+        emit ChallengeRewardClaimed(id, msg.sender, amount);
     }
 
     /// @notice Reveals the pre-image so a curator can recompute the content hash.

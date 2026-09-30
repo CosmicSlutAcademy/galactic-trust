@@ -32,6 +32,9 @@ contract GalacticTrustTest is Test {
     address internal attester3 = makeAddr("attester3");
     address internal challenger = makeAddr("challenger");
     address internal outsider = makeAddr("outsider");
+    address internal curator1 = makeAddr("curator1");
+    address internal curator2 = makeAddr("curator2");
+    address internal curator3 = makeAddr("curator3");
 
     bytes32 internal constant SECRET = keccak256("r5-confirmed-intel");
     bytes32 contentHash;
@@ -39,22 +42,29 @@ contract GalacticTrustTest is Test {
     uint256 internal constant BOND = 5_000e18;
     uint256 internal constant REWARD = 100e18;
     uint256 internal constant TREASURY = 1_000_000e18;
+    uint256 internal constant CHALLENGE_BOND = 100e18;
 
     function setUp() public {
         glt = new GalacticTrust(owner, MIN_STAKE, address(0), TREASURY, submitter);
         glt.registerAttester(attester1, 100);
         glt.registerAttester(attester2, 100);
         glt.registerAttester(attester3, 100);
+        glt.registerCurator(curator1, 100);
+        glt.registerCurator(curator2, 100);
+        glt.registerCurator(curator3, 100);
         contentHash = keccak256(abi.encode(SECRET, submitter));
 
         vm.startPrank(owner);
         glt.setRewardAmount(REWARD);
         glt.setAttesterBondAmount(BOND);
+        glt.setChallengeBondAmount(CHALLENGE_BOND);
         vm.stopPrank();
 
         _fund(attester1);
         _fund(attester2);
         _fund(attester3);
+        _fundChallenger(challenger);
+        _fundChallenger(outsider);
     }
 
     /// @dev Funds attesters from the treasury. No test-only mint exists in the token on purpose.
@@ -63,6 +73,42 @@ contract GalacticTrustTest is Test {
         glt.transfer(who, BOND * 2);
         vm.prank(who);
         glt.fundAttesterBond(BOND);
+    }
+
+    function _fundChallenger(address who) internal {
+        vm.prank(submitter);
+        glt.transfer(who, CHALLENGE_BOND * 2);
+        vm.prank(who);
+        glt.fundChallengeBond(CHALLENGE_BOND);
+    }
+
+    /// @dev Two of three curators uphold, which clears the 50% curator quorum.
+    function _resolveUp(bytes32 id) internal {
+        _skipWindow();
+        vm.prank(curator1);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, true);
+        glt.tallyDispute(id);
+    }
+
+    /// @dev Two of three curators reject, so the challenge is thrown out.
+    function _resolveDown(bytes32 id) internal {
+        _skipWindow();
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        glt.tallyDispute(id);
+    }
+
+    /// @dev An even split with quorum met. Stalls the dispute rather than guessing.
+    function _resolveSplit(bytes32 id) internal {
+        _skipWindow();
+        vm.prank(curator1);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
     }
 
     function _submit() internal returns (bytes32 id) {
@@ -100,7 +146,7 @@ contract GalacticTrustTest is Test {
         GalacticTrust.Attestation memory att = glt.getAttestation(id);
         assertEq(uint8(att.status), uint8(GalacticTrust.AttestationStatus.PENDING));
         assertEq(att.stake, MIN_STAKE);
-        assertEq(glt.balanceOf(address(glt)), BOND * 3 + MIN_STAKE, "bonds + locked stake");
+        assertEq(glt.balanceOf(address(glt)), BOND * 3 + CHALLENGE_BOND * 2 + MIN_STAKE, "bonds + challenge bonds + stake");
         assertEq(att.challengeDeadline, block.timestamp + glt.CHALLENGE_WINDOW());
     }
 
@@ -225,7 +271,7 @@ contract GalacticTrustTest is Test {
 
         assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.FINALIZED));
         assertEq(glt.balanceOf(submitter), before + MIN_STAKE + REWARD, "stake returned + reward minted");
-        assertEq(glt.balanceOf(address(glt)), BOND * 3, "only attester bonds remain");
+        assertEq(glt.balanceOf(address(glt)), BOND * 3 + CHALLENGE_BOND * 2, "attester + challenge bonds remain");
     }
 
     function test_RevertWhen_DoubleFinalize() public {
@@ -291,10 +337,8 @@ contract GalacticTrustTest is Test {
         bytes32 id = _submit();
         vm.prank(challenger);
         glt.challengeAttestation(id, "fabricated");
-        _skipWindow();
         uint256 supplyBefore = glt.totalSupply();
-        vm.prank(owner);
-        glt.resolveDispute(id, true);
+        _resolveUp(id);
 
         GalacticTrust.Attestation memory att = glt.getAttestation(id);
         assertEq(uint8(att.status), uint8(GalacticTrust.AttestationStatus.SLASHED));
@@ -311,10 +355,8 @@ contract GalacticTrustTest is Test {
         glt.signAttestation(id);
         vm.prank(challenger);
         glt.challengeAttestation(id, "fabricated");
-        _skipWindow();
         uint256 supplyBefore = glt.totalSupply();
-        vm.prank(owner);
-        glt.resolveDispute(id, true);
+        _resolveUp(id);
 
         assertEq(glt.attesterBond(attester1), 0, "signer bond slashed");
         assertEq(glt.attesterBond(attester2), 0, "signer bond slashed");
@@ -334,29 +376,25 @@ contract GalacticTrustTest is Test {
         glt.signAttestation(id);
         vm.prank(challenger);
         glt.challengeAttestation(id, "fabricated");
-        _skipWindow();
-        vm.prank(owner);
-        glt.resolveDispute(id, true);
+        _resolveUp(id);
 
         assertEq(glt.attesterBond(attester3), BOND, "innocent attester untouched");
     }
 
-    function test_PartialSlashPaysChallengers() public {
+    function test_PartialSlashSeedsPullPaymentPool() public {
         vm.prank(owner);
         glt.setSlashBps(5_000);
         bytes32 id = _submit();
         vm.prank(challenger);
         glt.challengeAttestation(id, "fabricated");
-        _skipWindow();
-        uint256 balBefore = glt.balanceOf(challenger);
-        vm.prank(owner);
-        glt.resolveDispute(id, true);
+        _resolveUp(id);
 
-        assertEq(
-            glt.balanceOf(challenger),
-            balBefore + MIN_STAKE / 2,
-            "unburned remainder compensates the challenger"
-        );
+        uint256 expected = MIN_STAKE / 2 + CHALLENGE_BOND;
+        assertEq(glt.payoutPool(id), expected, "unburned remainder + forfeited bond escrowed");
+        uint256 balBefore = glt.balanceOf(challenger);
+        vm.prank(challenger);
+        glt.claimChallengeReward(id);
+        assertEq(glt.balanceOf(challenger), balBefore + expected, "challenger paid on pull");
     }
 
     function test_RejectedDisputeLeavesBondsIntact() public {
@@ -365,10 +403,18 @@ contract GalacticTrustTest is Test {
         glt.signAttestation(id);
         vm.prank(challenger);
         glt.challengeAttestation(id, "wrong call");
-        _skipWindow();
-        vm.prank(owner);
-        glt.resolveDispute(id, false);
+        _resolveDown(id);
         assertEq(glt.attesterBond(attester1), BOND, "no slash on a rejected dispute");
+    }
+
+    function test_RejectedDisputeForfeitsChallengeBond() public {
+        bytes32 id = _submit();
+        vm.prank(attester1);
+        glt.signAttestation(id);
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "wrong call");
+        _resolveDown(id);
+        assertEq(glt.challengeBond(challenger), 0, "frivolous challenge forfeits its bond");
     }
 
     function test_RejectedDisputeReopensAndCanFinalize() public {
@@ -380,40 +426,181 @@ contract GalacticTrustTest is Test {
         glt.signAttestation(id);
         vm.prank(challenger);
         glt.challengeAttestation(id, "wrong call");
-        _skipWindow();
-        vm.prank(owner);
-        glt.resolveDispute(id, false);
+        _resolveDown(id);
         assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.PENDING));
 
         glt.finalizeAttestation(id);
         assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.FINALIZED));
     }
 
-    function test_RevertWhen_ResolveNonDisputed() public {
+    // ---------- curator panel ----------
+
+    function test_OneCuratorCannotDecideAlone() public {
         bytes32 id = _submit();
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "fabricated");
         _skipWindow();
-        vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NoChallengesToResolve.selector, id));
-        glt.resolveDispute(id, true);
+        vm.prank(curator1);
+        glt.castCuratorVote(id, true);
+        vm.expectRevert(
+            abi.encodeWithSelector(GalacticTrust.CuratorQuorumNotReached.selector, id, 100, 150)
+        );
+        glt.tallyDispute(id);
     }
 
-    function test_RevertWhen_ResolveNotOwner() public {
+    function test_RevertWhen_CuratorSplitNoMajority() public {
+        bytes32 id = _submit();
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "fabricated");
+        _resolveSplit(id);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.CuratorsSplit.selector, id, 100, 100));
+        glt.tallyDispute(id);
+    }
+
+    function test_RevertWhen_DoubleCuratorVote() public {
+        bytes32 id = _submit();
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "x");
+        _skipWindow();
+        vm.prank(curator1);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AlreadyVoted.selector, id, curator1));
+        glt.castCuratorVote(id, true);
+    }
+
+    function test_RevertWhen_NonCuratorVotes() public {
         bytes32 id = _submit();
         vm.prank(challenger);
         glt.challengeAttestation(id, "x");
         _skipWindow();
         vm.prank(outsider);
-        vm.expectRevert();
-        glt.resolveDispute(id, true);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NotCurator.selector, outsider));
+        glt.castCuratorVote(id, true);
     }
 
-    function test_RevertWhen_ResolveBeforeWindowCloses() public {
+    function test_RevertWhen_VoteBeforeWindowCloses() public {
         bytes32 id = _submit();
         vm.prank(challenger);
         glt.challengeAttestation(id, "x");
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.CuratorVoteTooEarly.selector, id));
+        glt.castCuratorVote(id, true);
+    }
+
+    function test_RevertWhen_VoteWithNoChallenges() public {
+        bytes32 id = _submit();
+        _skipWindow();
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NoChallengesToResolve.selector, id));
+        glt.castCuratorVote(id, true);
+    }
+
+    function test_OwnerCannotOverrideCurators() public {
+        bytes32 id = _submit();
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "x");
+        _skipWindow();
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.ChallengeWindowOpen.selector, id));
-        glt.resolveDispute(id, true);
+        vm.expectRevert();
+        glt.castCuratorVote(id, true);
+    }
+
+    // ---------- caps ----------
+
+    function test_RevertWhen_SignerCapReached() public {
+        bytes32 id = _submit();
+        uint256 n = glt.MAX_SIGNERS();
+        for (uint256 i = 0; i < n; i++) {
+            address a = address(uint160(0x1000 + i));
+            vm.prank(owner);
+            glt.registerAttester(a, 1);
+            vm.prank(submitter);
+            glt.transfer(a, BOND);
+            vm.prank(a);
+            glt.fundAttesterBond(BOND);
+            vm.prank(a);
+            glt.signAttestation(id);
+        }
+        address overflow = address(uint160(0x9999));
+        vm.prank(owner);
+        glt.registerAttester(overflow, 1);
+        vm.prank(submitter);
+        glt.transfer(overflow, BOND);
+        vm.prank(overflow);
+        glt.fundAttesterBond(BOND);
+        vm.prank(overflow);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.TooManySigners.selector, id));
+        glt.signAttestation(id);
+    }
+
+    function test_RevertWhen_ChallengerCapReached() public {
+        bytes32 id = _submit();
+        uint256 n = glt.MAX_CHALLENGERS();
+        for (uint256 i = 0; i < n; i++) {
+            address a = address(uint160(0x2000 + i));
+            _fundChallenger(a);
+            vm.prank(a);
+            glt.challengeAttestation(id, "spam");
+        }
+        address overflow = address(uint160(0x8888));
+        _fundChallenger(overflow);
+        vm.prank(overflow);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.TooManyChallengers.selector, id));
+        glt.challengeAttestation(id, "one too many");
+    }
+
+    // ---------- challenge bonds ----------
+
+    function test_RevertWhen_ChallengeWithoutBond() public {
+        bytes32 id = _submit();
+        address unbonded = makeAddr("unbonded-challenger");
+        vm.prank(unbonded);
+        vm.expectRevert(
+            abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, 0, CHALLENGE_BOND)
+        );
+        glt.challengeAttestation(id, "free challenge");
+    }
+
+    function test_RevertWhen_ClaimTwice() public {
+        bytes32 id = _submit();
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "fabricated");
+        _resolveUp(id);
+        vm.prank(challenger);
+        glt.claimChallengeReward(id);
+        vm.prank(challenger);
+        vm.expectRevert(
+            abi.encodeWithSelector(GalacticTrust.ClaimAlreadyMade.selector, id, challenger)
+        );
+        glt.claimChallengeReward(id);
+    }
+
+    function test_RevertWhen_ClaimOnRejectedDispute() public {
+        bytes32 id = _submit();
+        vm.prank(attester1);
+        glt.signAttestation(id);
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "wrong call");
+        _resolveDown(id);
+        vm.prank(challenger);
+        vm.expectRevert(
+            abi.encodeWithSelector(GalacticTrust.NothingToClaim.selector, id, challenger)
+        );
+        glt.claimChallengeReward(id);
+    }
+
+    function test_RevertWhen_NonChallengerClaims() public {
+        bytes32 id = _submit();
+        vm.prank(challenger);
+        glt.challengeAttestation(id, "fabricated");
+        _resolveUp(id);
+        uint256 balBefore = glt.balanceOf(outsider);
+        vm.prank(outsider);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NotAChallenger.selector, id, outsider));
+        glt.claimChallengeReward(id);
+        assertEq(glt.balanceOf(outsider), balBefore, "outsider cannot drain the pool");
+        assertEq(glt.payoutPool(id), CHALLENGE_BOND, "pool intact after failed claim");
     }
 
     function test_MultipleChallengersAllRecorded() public {
