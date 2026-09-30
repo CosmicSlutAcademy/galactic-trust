@@ -56,14 +56,19 @@ slashable, not eliminated. This is the honest version of the design.
 ## 3. Running it
 
 ```bash
-export PATH="$HOME/.foundry/bin:$PATH"   # REQUIRED — foundry is not on PATH by default
 cd ~/galactic-trust
 forge test          # 47/47
 forge build
 ```
 
-Foundry lives in `~/.foundry/bin`, not `~/.local/bin` (where the recon toolchain is).
-Consider appending the export to `~/.bashrc`.
+**PATH is already configured** — no manual export needed. It is set in both `~/.bashrc`
+(interactive) and `~/.profile` (login), verified working from both.
+
+⚠️ **`/usr/bin/forge` is NOT Foundry.** It is *ZOE*, an unrelated estimation tool from 2013
+(`ZOE library version 2013-02-16`), and it shadows the real binary. If `forge --version` prints
+`ZOE ERROR ... unknown option`, the wrong one is resolving. The `.foundry/bin` entries are placed
+*before* `/usr/bin` for exactly this reason. Verified: `bash -lc 'command -v forge'` →
+`/home/alexa/.foundry/bin/forge`.
 
 **Restoring dependencies on a fresh clone** (`lib/` is gitignored — 18 MB of vendored code
 does not belong in git history):
@@ -226,6 +231,17 @@ Getters: `challengeCount`, `signerWeight`, `attesterBond`, `requiredQuorumWeight
 
 - WSL has no Linux Node; `node` is absent and `npm` resolves to the Windows binary via `/mnt/c`.
   Irrelevant for Solidity, but do not assume a Node toolchain works in WSL.
+
+- **`/usr/bin/forge` is ZOE, not Foundry.** A 2013 estimation tool that shadows the real
+  binary on the default PATH. Symptom: `forge test` prints `ZOE ERROR ... unknown option`.
+  Found only by testing resume in a clean shell — `forge` was resolving to the wrong program
+  the whole time. Both `~/.bashrc` and `~/.profile` now prepend `~/.foundry/bin`.
+
+- **Do not append to `~/.bashrc` via a shell heredoc.** The layers between PowerShell,
+  `wsl.exe` and `bash` expanded `$PATH` during the append, freezing a ~2 KB absolute PATH
+  (including every Windows mount) into the file. Write the line with a literal `\$PATH`, or
+  use a heredoc with a quoted delimiter that survives the round trip. Verify with
+  `tail -3 ~/.bashrc` and check the line is short.
 
 ---
 
