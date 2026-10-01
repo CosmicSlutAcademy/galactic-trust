@@ -3,4 +3,15 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
+# The optimizer is off by default, which left the runtime bytecode at ~38 KB against the
+# 24,576 B EIP-170 limit, so the contract could not have been deployed at all. Verified with
+# `forge build --sizes`. Turns are pinned low rather than high because higher values traded
+# a few hundred bytes for a large gas regression on the settlement loops.
+optimizer = true
+optimizer_runs = 200
+# via_ir was measured at 21,703 B runtime (381 B *larger*) than the legacy pipeline at
+# 21,322 B, so it stays off. Margin to EIP-170 is 3,254 B and shrinking as features land —
+# re-check with `forge build --sizes` on every change.
+via_ir = false
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

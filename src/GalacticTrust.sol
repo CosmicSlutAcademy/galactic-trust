@@ -7,7 +7,7 @@ import {ERC20Votes} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Vo
 import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Nonces} from "@openzeppelin/contracts/utils/Nonces.sol";
-import {IVerifier} from "./IVerifier.sol";
+import {IVerifier, EvidenceVerdict} from "./IVerifier.sol";
 
 contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, ReentrancyGuard {
     enum EvidenceTier {
@@ -45,6 +45,21 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         uint128 attestationWeight;
         uint128 quorumWeight;
         uint256 stake;
+
+        /// @dev Snapshotted at submission alongside `quorumWeight`. Reading curator quorum
+        /// live at tally time let the owner appoint a whale curator mid-dispute and push the
+        /// bar above reachable weight, freezing the dispute with funds locked.
+        uint128 curatorQuorumWeight;
+        /// @dev When an unresolved verdict must be forced to a ruling. After this, a dispute
+        /// that has not reached quorum or is tied can be expired instead of stalling forever.
+        uint64 reviewDeadline;
+        /// @dev Set once the pre-image has been disclosed and matched. Gates a second reveal.
+        bool secretRevealed;
+        /// @dev Set when a curator panel rejects a machine referral (REFUTED/UNRESOLVED with
+        /// no challenger). Records that the humans deliberately overrode the verdict, which is
+        /// the only way such an attestation becomes finalizable. Without this a rejected
+        /// referral would deadlock: it cannot finalize (verdict) and cannot be disputed again.
+        bool panelOverride;
     }
 
     error NotAttester(address account);
@@ -75,9 +90,18 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     error CuratorsSplit(bytes32 id, uint256 upholdWeight, uint256 rejectWeight);
     error TooManySigners(bytes32 id);
     error TooManyChallengers(bytes32 id);
+    error NothingToRecover(uint256 requested, uint256 excess);
     error ClaimAlreadyMade(bytes32 id, address account);
     error NothingToClaim(bytes32 id, address account);
     error NotAChallenger(bytes32 id, address account);
+    error ZeroAmount();
+    error EvidenceNotFinalizable(bytes32 id, uint8 verdict);
+    error ReviewNotExpirable(bytes32 id);
+    error ReviewAlreadyResolved(bytes32 id);
+    error NotAuthorizedRevealer(bytes32 id, address account);
+    error AlreadyRevealed(bytes32 id);
+    error ReviewNotOpen(bytes32 id);
+    error VerifierReverted(bytes32 id);
     event AttesterRegistered(address indexed account, uint128 weight);
     event AttesterWeightUpdated(address indexed account, uint128 weight);
     event AttesterDeactivated(address indexed account);
@@ -103,12 +127,17 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     event Disputed(bytes32 indexed id, uint256 upholdWeight, uint256 rejectWeight);
     event ChallengeRewardClaimed(bytes32 indexed id, address indexed account, uint256 amount);
     event PoolSeeded(bytes32 indexed id, uint256 each, uint256 challengers);
+    event ReviewExpired(bytes32 indexed id, uint256 upholdWeight, uint256 rejectWeight);
     event ChallengerBondForfeited(bytes32 indexed id, address indexed challenger, uint256 amount);
     event SecretRevealed(bytes32 indexed id, bytes32 contentHash, bool valid);
     event VerifierSet(address indexed verifier);
 
     uint128 public constant BPS_DENOMINATOR = 10_000;
     uint256 public constant CHALLENGE_WINDOW = 2 days;
+
+    /// @dev How long a curator panel has to rule before the dispute can be expired. An
+    /// unreached quorum or a tie used to lock stake and bonds with no exit at all.
+    uint256 public constant REVIEW_WINDOW = 7 days;
 
     /// @dev Hard caps so settlement cost is bounded regardless of committee size.
     uint256 public constant MAX_SIGNERS = 50;
@@ -120,7 +149,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     uint256 public totalAttesterWeight;
     uint256 public rewardAmount = 100e18;
     uint256 public slashBps = 10_000;
-    uint256 public attesterBondAmount;
+    uint256 public attesterBondAmount = 100e18;
     uint256 public attesterSlashBps = 10_000;
 
     mapping(address => Attester) private _attesters;
@@ -137,10 +166,29 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     mapping(bytes32 => uint128) public rejectWeight;
     mapping(bytes32 => mapping(address => bool)) public hasClaimed;
     mapping(bytes32 => mapping(address => bool)) public wasChallenger;
+
+    /// @dev Challenge bond committed to a specific open challenge. The aggregate in
+    /// `lockedChallengeBond` gates withdrawal; this per-attestation figure makes the
+    /// release exact even if `challengeBondAmount` is re-set while a dispute is in flight.
+    mapping(bytes32 => mapping(address => uint256)) public challengeLock;
+    mapping(address => uint256) public lockedChallengeBond;
+
+    /// @dev Each challenger's settled entitlement, assigned once at tally time. A single
+    /// shared `payoutPool` figure cannot express N independent claims: the first claimer
+    /// zeroes it and the rest revert, stranding the remainder.
+    mapping(bytes32 => mapping(address => uint256)) public payoutShare;
     uint256 public totalCuratorWeight;
-    uint256 public challengeBondAmount;
+    uint256 public challengeBondAmount = 100e18;
     mapping(address => uint256) public challengeBond;
     mapping(bytes32 => uint256) public payoutPool;
+
+    /// @dev Tokens the contract owes and may never burn. Kept as a running total so an
+    /// accounting mistake surfaces as a revert in the tests rather than as insolvency in
+    /// production. `balanceOf(address(this))` is the sum of every liability below.
+    uint256 public totalStaked;
+    uint256 public totalPayoutEscrow;
+    uint256 public outstandingAttesterBond;
+    uint256 public outstandingChallengeBond;
 
     modifier onlyAttester() {
         Attester storage a = _attesters[msg.sender];
@@ -214,6 +262,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (bal < amount) revert InsufficientStake(bal, amount);
         _update(msg.sender, address(this), amount);
         attesterBond[msg.sender] += amount;
+        outstandingAttesterBond += amount;
         emit AttesterBondFunded(msg.sender, amount);
     }
 
@@ -224,6 +273,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         uint256 amount = attesterBond[msg.sender];
         if (amount == 0) revert NoBondToWithdraw();
         attesterBond[msg.sender] = 0;
+        outstandingAttesterBond -= amount;
         _update(address(this), msg.sender, amount);
         emit AttesterBondWithdrawn(msg.sender, amount);
     }
@@ -268,16 +318,24 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (bal < amount) revert InsufficientStake(bal, amount);
         _update(msg.sender, address(this), amount);
         challengeBond[msg.sender] += amount;
+        outstandingChallengeBond += amount;
     }
 
+    /// @dev Rejects zero. A zero bond makes challenging free, which reinstates exactly the
+    /// griefing vector the bond exists to close, so it cannot be set back to free.
     function setChallengeBondAmount(uint256 amount) external onlyOwner {
+        if (amount == 0) revert ZeroAmount();
         challengeBondAmount = amount;
     }
 
+    /// @notice Withdraws only the bond that is not backing an open challenge. A challenger that
+    /// could lift its bond the instant it filed could never lose it, so the anti-frivolity
+    /// guarantee would not exist.
     function withdrawChallengeBond() external nonReentrant {
-        uint256 amount = challengeBond[msg.sender];
+        uint256 amount = challengeBond[msg.sender] - lockedChallengeBond[msg.sender];
         if (amount == 0) revert NoBondToWithdraw();
-        challengeBond[msg.sender] = 0;
+        challengeBond[msg.sender] -= amount;
+        outstandingChallengeBond -= amount;
         _update(address(this), msg.sender, amount);
     }
 
@@ -340,6 +398,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             uint256 bal = balanceOf(msg.sender);
             if (bal < minStake) revert InsufficientStake(bal, minStake);
             _update(msg.sender, address(this), minStake);
+            totalStaked += minStake;
         }
         id = keccak256(abi.encode(msg.sender, contentHash, block.timestamp, secret));
         Attestation storage att = _attestations[id];
@@ -352,6 +411,8 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         att.submittedAt = uint64(block.timestamp);
         att.challengeDeadline = uint64(block.timestamp + CHALLENGE_WINDOW);
         att.quorumWeight = uint128(requiredQuorumWeight());
+        att.curatorQuorumWeight = uint128(curatorQuorumWeight());
+        att.reviewDeadline = uint64(block.timestamp + CHALLENGE_WINDOW + REVIEW_WINDOW);
         att.stake = minStake;
         emit AttestationSubmitted(id, msg.sender, contentHash, tier, minStake);
     }
@@ -372,19 +433,46 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         emit AttestationSigned(id, msg.sender, a.weight);
     }
 
-    /// @notice Mints the reward. Requires quorum, an expired window, and zero challenges.
+    /// @notice Mints the reward. Requires a CONFIRMED verdict, quorum, an expired challenge
+    /// window, and zero challenges. A REFUTED or UNRESOLVED verdict cannot be finalized here:
+    /// both must clear a curator panel instead, which is the failsafe that stops a broken
+    /// verifier from either freezing the protocol or silently minting.
     function finalizeAttestation(bytes32 id) external nonReentrant {
         Attestation storage att = _attestations[id];
         if (att.status == AttestationStatus.FINALIZED) revert QuorumReached(id);
         if (att.status != AttestationStatus.PENDING) revert AttestationNotPending(id);
         if (block.timestamp <= att.challengeDeadline) revert ChallengeWindowOpen(id);
         if (challengers[id].length > 0) revert AttestationUnderChallenge(id);
+        EvidenceVerdict verdict = _verdict(att);
+        // A panel may deliberately override a REFUTED/UNRESOLVED referral. A CONFIRMED verdict
+        // with a rejected referral is already covered by `panelOverride` being false.
+        if (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride)
+            revert EvidenceNotFinalizable(id, uint8(verdict));
         if (att.attestationWeight < att.quorumWeight)
             revert QuorumNotReached(id, att.attestationWeight, att.quorumWeight);
         att.status = AttestationStatus.FINALIZED;
-        if (att.stake > 0) _update(address(this), att.submitter, att.stake);
+        if (att.stake > 0) {
+            totalStaked -= att.stake;
+            _update(address(this), att.submitter, att.stake);
+        }
         _mint(att.submitter, rewardAmount);
         emit AttestationFinalized(id, att.submitter, rewardAmount);
+    }
+
+    /// @dev Reads the verifier defensively. No verifier means CONFIRMED, so the honest
+    /// "no opinion available" case does not block an otherwise valid attestation. A reverting
+    /// verifier is treated as UNRESOLVED rather than propagating, because a broken proof system
+    /// must not be able to halt finalization for every attestation at once.
+    function _verdict(Attestation storage att) internal view returns (EvidenceVerdict) {
+        address v = address(verifier);
+        if (v == address(0)) return EvidenceVerdict.CONFIRMED;
+        try IVerifier(v).verifyEvidence(att.contentHash, uint8(att.tier)) returns (
+            EvidenceVerdict verdict
+        ) {
+            return verdict;
+        } catch {
+            return EvidenceVerdict.UNRESOLVED;
+        }
     }
 
     /// @notice Red-team flag. Challenges accumulate; a single challenger cannot freeze an
@@ -395,9 +483,11 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (block.timestamp > att.challengeDeadline) revert ChallengeWindowClosed(id);
         if (hasChallenged[id][msg.sender]) revert AlreadyChallenged(id, msg.sender);
         if (challengers[id].length >= MAX_CHALLENGERS) revert TooManyChallengers(id);
-        uint256 bond = challengeBond[msg.sender];
+        uint256 bond = challengeBond[msg.sender] - lockedChallengeBond[msg.sender];
         if (bond < challengeBondAmount)
             revert BondBelowRequired(bond, challengeBondAmount);
+        challengeLock[id][msg.sender] = challengeBondAmount;
+        lockedChallengeBond[msg.sender] += challengeBondAmount;
         hasChallenged[id][msg.sender] = true;
         wasChallenger[id][msg.sender] = true;
         challengers[id].push(msg.sender);
@@ -410,7 +500,10 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         Attestation storage att = _attestations[id];
         if (att.status != AttestationStatus.PENDING) revert NotPendingOrDisputed(id);
         if (block.timestamp <= att.challengeDeadline) revert CuratorVoteTooEarly(id);
-        if (challengers[id].length == 0) revert NoChallengesToResolve(id);
+        // A referral needs no challenger: a REFUTED or UNRESOLVED verdict is reviewable on
+        // its own. Rejecting that case here would leave the tri-state gate with no exit.
+        if (challengers[id].length == 0 && _verdict(att) == EvidenceVerdict.CONFIRMED)
+            revert NoChallengesToResolve(id);
         if (curatorVote[id][msg.sender]) revert AlreadyVoted(id, msg.sender);
         Attester storage c = _curators[msg.sender];
         curatorVote[id][msg.sender] = true;
@@ -428,17 +521,56 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         Attestation storage att = _attestations[id];
         if (att.status != AttestationStatus.PENDING) revert NotPendingOrDisputed(id);
         if (block.timestamp <= att.challengeDeadline) revert CuratorVoteTooEarly(id);
-        if (challengers[id].length == 0) revert NoChallengesToResolve(id);
+        if (challengers[id].length == 0 && _verdict(att) == EvidenceVerdict.CONFIRMED)
+            revert NoChallengesToResolve(id);
         uint256 up = upholdWeight[id];
         uint256 down = rejectWeight[id];
-        if (up + down < curatorQuorumWeight())
-            revert CuratorQuorumNotReached(id, up + down, curatorQuorumWeight());
-        if (up == down) revert CuratorsSplit(id, up, down);
-        disputeUpheld[id] = up > down;
-        emit Disputed(id, up, down);
-        if (up > down) {
+        // Snapshotted, so the owner cannot move the bar after the dispute is filed.
+        uint256 needed = att.curatorQuorumWeight;
+        if (up + down < needed) revert CuratorQuorumNotReached(id, up + down, needed);
+        if (up == down) {
+            // A tie is still a stall until the review deadline passes. `expireReview` is the
+            // exit; refusing to tally here just forces the caller to use it.
+            revert CuratorsSplit(id, up, down);
+        }
+        _resolve(id, att, up > down);
+    }
+
+    /// @notice Forces a stalled dispute to a ruling once the review window has closed. Reached
+    /// quorum but tied, or failed to reach quorum at all. Defaults to rejecting the
+    /// attestation's challengers and returning it to PENDING, so an unreachable or deadlocked
+    /// panel can never slash a submitter who did nothing wrong.
+    function expireReview(bytes32 id) external nonReentrant {
+        Attestation storage att = _attestations[id];
+        if (att.status != AttestationStatus.PENDING) revert NotPendingOrDisputed(id);
+        if (block.timestamp <= att.reviewDeadline) revert ReviewNotExpirable(id);
+        uint256 up = upholdWeight[id];
+        uint256 down = rejectWeight[id];
+        if (up + down >= att.curatorQuorumWeight && up != down) revert ReviewAlreadyResolved(id);
+
+        // A REFUTED proof is a positive finding, not an absence of one, so expiry cannot
+        // launder it: the submitter is still penalised.
+        if (_verdict(att) == EvidenceVerdict.REFUTED && up >= down) {
+            _resolve(id, att, true);
+            return;
+        }
+        emit ReviewExpired(id, up, down);
+        _resolve(id, att, false);
+    }
+
+    /// @dev Applies a ruling. `upheld` slashes the submitter and every signing attester;
+    /// otherwise challenge bonds are forfeited and the attestation returns to PENDING.
+    function _resolve(bytes32 id, Attestation storage att, bool upheld) internal {
+        disputeUpheld[id] = upheld;
+        emit Disputed(id, upholdWeight[id], rejectWeight[id]);
+        if (upheld) {
             _penalise(id, att);
         } else {
+            // Rejecting a dispute against a REFUTED/UNRESOLVED verdict means the panel is
+            // overruling the machine. Without this the attestation could never finalize
+            // (verdict blocks it), could never be re-challenged (window closed) and could
+            // never be re-reviewed (curators already voted) — a permanent deadlock.
+            if (_verdict(att) != EvidenceVerdict.CONFIRMED) att.panelOverride = true;
             _forfeitChallengeBonds(id);
             _clear(challengers[id]);
             emit DisputeResolved(id, false);
@@ -453,8 +585,10 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         for (uint256 i = 0; i < ch.length;) {
             address c = ch[i];
             uint256 amount = challengeBond[c];
+            _releaseLock(id, c);
             if (amount > 0) {
                 challengeBond[c] = 0;
+                outstandingChallengeBond -= amount;
                 _burn(address(this), amount);
                 emit ChallengerBondForfeited(id, c, amount);
             }
@@ -470,6 +604,17 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         }
     }
 
+    /// @dev Frees the bond a challenger committed to a now-settled challenge. Uses the
+    /// per-attestation figure rather than the current `challengeBondAmount` so a mid-dispute
+    /// setter change cannot leave the account permanently locked.
+    function _releaseLock(bytes32 id, address c) internal {
+        uint256 lock = challengeLock[id][c];
+        if (lock > 0) {
+            challengeLock[id][c] = 0;
+            lockedChallengeBond[c] -= lock;
+        }
+    }
+
     /// @dev Burns the submitter's stake, slashes every attester who certified the fabrication,
     /// and escrows the unburned remainder plus forfeited challenge bonds for challengers to
     /// pull. Without the attester leg a colluding quorum signs a lie, the submitter is
@@ -480,6 +625,10 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         uint256 burn = (att.stake * slashBps) / BPS_DENOMINATOR;
         uint256 remainder = att.stake - burn;
         att.status = AttestationStatus.SLASHED;
+        // The whole stake leaves the submitter's liability: `burn` is destroyed and the remainder
+        // becomes challenge-owed escrow, which is counted below. Subtracting only `burn` would
+        // double-count the remainder as stake and as payout at the same time.
+        totalStaked -= att.stake;
         att.stake = 0;
         if (burn > 0) _burn(address(this), burn);
         emit DisputeResolved(id, true);
@@ -491,6 +640,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             uint256 pen = (attesterBond[a] * attesterSlashBps) / BPS_DENOMINATOR;
             if (pen > 0) {
                 attesterBond[a] -= pen;
+                outstandingAttesterBond -= pen;
                 _burn(address(this), pen);
                 emit AttesterSlashed(id, a, pen);
             }
@@ -510,16 +660,27 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             }
         }
         uint256 pool = remainder + forfeited;
-        uint256 totalChallengers = n;
         uint256 each = n > 0 ? pool / n : 0;
-        payoutPool[id] = each;
+
+        // Assign each challenger its own entitlement. A single shared pool figure cannot
+        // represent N independent claims, because the first claimant zeroes it and the
+        // remaining challengers revert with the rest of the forfeiture stranded.
         for (uint256 i = 0; i < n;) {
-            challengeBond[ch[i]] = 0;
+            address c = ch[i];
+            _releaseLock(id, c);
+            payoutShare[id][c] = each;
+            challengeBond[c] = 0;
             unchecked {
                 ++i;
             }
         }
-        emit PoolSeeded(id, each, totalChallengers);
+        outstandingChallengeBond -= forfeited;
+
+        // Integer division leaves dust. It stays in the contract rather than being silently
+        // burned, so the escrow total remains exactly reconcilable against the held balance.
+        payoutPool[id] = each * n;
+        totalPayoutEscrow += each * n;
+        emit PoolSeeded(id, each, n);
         _clear(ch);
     }
 
@@ -527,35 +688,82 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     /// challenger set cannot make settlement unspendable.
     function claimChallengeReward(bytes32 id) external nonReentrant {
         if (!wasChallenger[id][msg.sender]) revert NotAChallenger(id, msg.sender);
-        if (hasClaimed[id][msg.sender]) revert ClaimAlreadyMade(id, msg.sender);
         if (disputeUpheld[id] != true) revert NothingToClaim(id, msg.sender);
-        uint256 amount = payoutPool[id];
+        if (hasClaimed[id][msg.sender]) revert ClaimAlreadyMade(id, msg.sender);
+        uint256 amount = payoutShare[id][msg.sender];
         if (amount == 0) revert NothingToClaim(id, msg.sender);
         hasClaimed[id][msg.sender] = true;
-        payoutPool[id] = 0;
+        payoutShare[id][msg.sender] = 0;
+        payoutPool[id] -= amount;
+        totalPayoutEscrow -= amount;
         _update(address(this), msg.sender, amount);
         emit ChallengeRewardClaimed(id, msg.sender, amount);
     }
 
-    /// @notice Reveals the pre-image so a curator can recompute the content hash.
-    function revealSecret(bytes32 id, bytes32 secret) external {
+    /// @notice Verifies a candidate pre-image against the committed content hash. Stateless: it
+    /// records nothing, so a wrong guess costs the caller a transaction and nothing else.
+/// This is the safe form of reveal — compare the returned flag rather than trusting storage.
+    function checkSecret(bytes32 id, bytes32 candidate) external view returns (bool valid) {
+        Attestation storage att = _attestations[id];
+        return keccak256(abi.encode(candidate, att.submitter)) == att.contentHash;
+    }
+
+    /// @notice Discloses the pre-image after the challenge window has closed, so a curator can
+    /// audit it. Restricted to a challenger of this attestation or any curator, because
+    /// unrestricted it destroys the confidentiality the commit-reveal exists for during the
+    /// window anyone can call.
+    ///
+    /// @dev Verifies and emits without mutating. The earlier version overwrote `att.secret`
+    /// unconditionally, so any address could clobber the submitter's secret with garbage. The
+    /// first valid reveal is recorded once; a later wrong guess cannot replace it.
+    function revealSecret(bytes32 id, bytes32 candidate) external {
         Attestation storage att = _attestations[id];
         if (att.status == AttestationStatus.SLASHED) revert AttestationNotFinalized(id);
         if (att.status == AttestationStatus.FINALIZED) revert AttestationNotFinalized(id);
-        bool valid = keccak256(abi.encode(secret, att.submitter)) == att.contentHash;
-        att.secret = secret;
+        if (block.timestamp <= att.challengeDeadline) revert ChallengeWindowOpen(id);
+        if (wasChallenger[id][msg.sender] != true && !_isCurator(msg.sender))
+            revert NotAuthorizedRevealer(id, msg.sender);
+
+        bool valid = keccak256(abi.encode(candidate, att.submitter)) == att.contentHash;
+        if (valid) {
+            if (att.secretRevealed) revert AlreadyRevealed(id);
+            att.secret = candidate;
+            att.secretRevealed = true;
+        }
         emit SecretRevealed(id, att.contentHash, valid);
     }
 
-    /// @notice Optional ZK hook. Returns true when no verifier is configured.
-    function passesVerifier(bytes32 id) external view returns (bool) {
-        if (address(verifier) == address(0)) return true;
-        Attestation storage att = _attestations[id];
-        return verifier.verifyEvidence(att.contentHash, uint8(att.tier));
+    function _isCurator(address account) internal view returns (bool) {
+        Attester storage c = _curators[account];
+        return c.account != address(0) && c.active;
     }
 
-    /// @notice Burns the treasury balance of slashed stakes.
+    /// @notice The machine's opinion on an attestation. CONFIRMED when no verifier is set.
+    /// Read this directly if you want the raw verdict; it is the same value `finalizeAttestation`
+    /// gates on, and it never reverts.
+    function evidenceVerdict(bytes32 id) external view returns (EvidenceVerdict) {
+        return _verdict(_attestations[id]);
+    }
+
+    /// @notice Total tokens the contract owes to third parties. Never burnable.
+    function totalLiabilities() public view returns (uint256) {
+        return totalStaked + totalPayoutEscrow + outstandingAttesterBond + outstandingChallengeBond;
+    }
+
+    /// @notice Tokens held that no one is owed to. The only thing the owner may burn.
+    /// Burning anything above this would consume live stakes or bonds and leave the
+    /// contract insolvent while still reporting those liabilities as outstanding.
+    function excessBalance() public view returns (uint256) {
+        uint256 held = balanceOf(address(this));
+        uint256 owed = totalLiabilities();
+        return held > owed ? held - owed : 0;
+    }
+
+    /// @notice Burns only the unbacked remainder, so slashed stake cannot be turned into a
+    /// rug on pending stakes or live bonds.
     function recoverExcessStake(uint256 amount) external onlyOwner nonReentrant {
+        uint256 excess = excessBalance();
+        if (amount > excess) revert NothingToRecover(amount, excess);
         _burn(address(this), amount);
     }
 }
