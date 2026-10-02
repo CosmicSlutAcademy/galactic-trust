@@ -580,12 +580,28 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
 Items 1 (curator bond), 2 (size reclamation) and 3 (invariant handler) were all closed on
 2026-10-02 — see §4, §5 and §1. What remains:
 
-1. ☐ **Add a git remote.** History is local-only, so the whole project dies with the laptop —
-   the exact failure `~/bounty/SESSION.md` opens with. The cheapest high-value item on the list
-   and the only one that takes five minutes. **Decided: private.** Blocked on the user for the
-   remote URL — `gh` is not installed and there are no SSH keys. Also pending: the local git
-   identity is a placeholder (`GLOBAL.CYBER.INTELLIGENCE@EMAIL.COM`) and should be corrected
-   before the first push, since commit history is permanent.
+1. ☑ **Add a git remote.** Closed 2026-10-02. Remote is
+   `https://github.com/CosmicSlutAcademy/galactic-trust`, **public** — the user overrode the
+   private decision recorded earlier, after being told that `SESSION.md` itself is published and
+   is a disclosure surface. `gh` 2.46.0 is installed and authenticated over HTTPS, so no SSH
+   key was needed; `gh` is the git credential helper, so pushes need no further setup.
+
+   **The placeholder identity was real and was repo-local, not global.** `git config --global
+   user.email` was *absent*; the uppercased `GLOBAL.CYBER.INTELLIGENCE@EMAIL.COM` lived in
+   `galactic-trust/.git/config`, which takes precedence. Setting only the global would have
+   looked like a fix while leaving every commit on the old value — the same "accepted silently
+   and ignored" class of misconfiguration as top-level `invariant_runs`. **When an identity
+   looks wrong, check `git config user.email` from inside the repo, not `--global`.**
+
+   All 9 commits were rewritten with `filter-branch --env-filter` onto
+   `⟠Δδ∞•⟐X∑⅃Δ <global.cyber.intelligence@email.com>`, which is the user's own stated identity
+   rather than a placeholder. Unpushed, so this was free — and it is the last moment it ever
+   will be. Reflogs expired and `refs/original` removed so the old casing does not survive in
+   the object store. Verified: 0 uppercase, 9 lowercase.
+
+   Three commits were made from the previously-uncommitted work rather than one blob, split by
+   file: the curator bond, the optimizer retune, this log.
+
 2. ☐ **Reject `deactivateAttester` / `deactivateCurator` on unknown addresses** — they
    silently succeed today, which hides typos in owner scripts. The invariant handler exercises
    both, so a regression here will now surface as a weight-total mismatch.
@@ -595,7 +611,11 @@ Items 1 (curator bond), 2 (size reclamation) and 3 (invariant handler) were all 
    a verifier that returns `UNRESOLVED` when a proof is malformed. Note this needs a
    circom/snarkjs toolchain and §5 records that WSL has no working Node — probably blocked.
 4. ☐ **Replace the boilerplate `README.md`** (still the Foundry template). It must state
-   plainly that GLT asserts *staked testimony*, never truth.
+   plainly that GLT asserts *staked testimony*, never truth. **Promoted by item 1:** the repo is
+   public, so the Foundry template is now the front page of the project and advertises itself as
+   a counterexample starter rather than as GLT. This is now the cheapest remaining item and the
+   only one a stranger will judge the work by. Say plainly that it is unaudited and not
+   deployable with real value yet, or the first reader will assume otherwise.
 5. ☐ **Test the deploy script against a local Anvil node**, then a testnet. Both bond amounts
    now default non-zero, so the script no longer needs to set them — but it *will* need to fund
    curator bonds before the panel can rule on anything.
