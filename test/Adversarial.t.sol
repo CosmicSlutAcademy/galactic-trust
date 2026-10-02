@@ -31,6 +31,7 @@ contract AdversarialTest is Test {
     uint256 internal constant REWARD = 100e18;
     uint256 internal constant TREASURY = 10_000_000e18;
     uint256 internal constant CHALLENGE_BOND = 100e18;
+    uint256 internal constant CURATOR_BOND = 1_000e18;
 
     uint256 private _nonce;
 
@@ -46,6 +47,7 @@ contract AdversarialTest is Test {
         glt.setRewardAmount(REWARD);
         glt.setAttesterBondAmount(BOND);
         glt.setChallengeBondAmount(CHALLENGE_BOND);
+        glt.setCuratorBondAmount(CURATOR_BOND);
         vm.stopPrank();
 
         _fund(attester1);
@@ -53,6 +55,9 @@ contract AdversarialTest is Test {
         _fundC(challenger1);
         _fundC(challenger2);
         _fundC(outsider);
+        _fundCur(curator1);
+        _fundCur(curator2);
+        _fundCur(curator3);
 
         v = new MockV(EvidenceVerdict.CONFIRMED);
         vm.prank(owner);
@@ -71,6 +76,13 @@ contract AdversarialTest is Test {
         glt.transfer(who, CHALLENGE_BOND * 2);
         vm.prank(who);
         glt.fundChallengeBond(CHALLENGE_BOND);
+    }
+
+    function _fundCur(address who) internal {
+        vm.prank(submitter);
+        glt.transfer(who, CURATOR_BOND * 2);
+        vm.prank(who);
+        glt.fundCuratorBond(CURATOR_BOND);
     }
 
     /// Distinct secret per submission: the id is derived from the timestamp, which Foundry
@@ -301,8 +313,8 @@ contract AdversarialTest is Test {
         _solvent();
 
         // expiry on a tie, with the machine satisfied so expiry can default to reject.
-// The upheld referral above slashed both bonds to zero, so they must re-bond first —
-// signing requires a live bond.
+        // The upheld referral above slashed both bonds to zero, so they must re-bond first —
+        // signing requires a live bond.
         v.setVerdict(EvidenceVerdict.CONFIRMED);
         _fund(attester1);
         _fund(attester2);
@@ -363,6 +375,304 @@ contract AdversarialTest is Test {
         vm.prank(curator1);
         vm.expectRevert();
         glt.castCuratorVote(id, true);
+        _solvent();
+    }
+
+    // ---------- curator bond ----------
+
+    /// The headline case. Before the bond, an owner-appointed curator cost nothing, so the
+    /// panel was the owner's key in a committee costume. Weight without a bond must not vote.
+    function test_UnbondedCuratorCannotVote() public {
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        address freeRider = makeAddr("unbondedCurator");
+        vm.prank(owner);
+        glt.registerCurator(freeRider, 100_000);
+
+        vm.prank(freeRider);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, 0, CURATOR_BOND));
+        glt.castCuratorVote(id, true);
+        assertEq(glt.signerWeight(id), 100, "no weight moved");
+        _solvent();
+    }
+
+    /// Weight must not be laundered through a bond that arrives after the snapshot. A curator
+    /// who bonds *after* an attestation is submitted still cannot carry weight without skin —
+    /// but once bonded they can, which is the point: the bar is skin, not tenure.
+    function test_OwnerCannotAppointAWeighlessWhale() public {
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        vm.prank(owner);
+        glt.registerCurator(whale, type(uint128).max);
+        // Quorum is basis-points of total curator weight, so the whale has inflated the bar.
+        assertEq(
+            glt.curatorQuorumWeight(),
+            (uint256(type(uint128).max) + 300) * 5_000 / 10_000,
+            "weight counts toward the live bar"
+        );
+
+        // The whale cannot reach the bar it just inflated: no bond, no vote.
+        vm.prank(whale);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, 0, CURATOR_BOND));
+        glt.castCuratorVote(id, true);
+
+        // And the in-flight dispute is still resolvable by the bonded panel, because curator
+        // quorum was snapshotted at submission.
+        vm.prank(curator1);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, true);
+        glt.tallyDispute(id);
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.SLASHED));
+        _solvent();
+    }
+
+    /// The core incentive. A curator who rules against the panel majority loses bond, because
+    /// otherwise ruling is free and arbitrary — nothing downstream ever disagrees with them.
+    function test_LosingSideCuratorsAreSlashed() public {
+        vm.prank(owner);
+        glt.setCuratorSlashBps(10_000);
+
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false); // dissenter, will lose
+        vm.prank(curator2);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator3);
+        glt.castCuratorVote(id, true);
+        glt.tallyDispute(id);
+
+        assertEq(glt.curatorBond(curator1), 0, "dissenting curator burned in full");
+        assertEq(glt.curatorBond(curator2), CURATOR_BOND, "majority untouched");
+        assertEq(glt.curatorBond(curator3), CURATOR_BOND, "majority untouched");
+        assertEq(glt.outstandingCuratorBond(), CURATOR_BOND * 2, "liability tracks the burn");
+        _solvent();
+    }
+
+    /// Partial slash must be exactly proportional, and the bond must survive to be re-bonded.
+    function test_PartialCuratorSlashIsProportional() public {
+        vm.prank(owner);
+        glt.setCuratorSlashBps(2_500); // 25%
+
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator3);
+        glt.castCuratorVote(id, true);
+        glt.tallyDispute(id);
+
+        uint256 expected = CURATOR_BOND - (CURATOR_BOND * 2_500) / 10_000;
+        assertEq(glt.curatorBond(curator1), expected, "25% gone");
+        _solvent();
+
+        // Below the bar now, so the shorn curator cannot immediately rule again.
+        // attester2 signs and `outsider` challenges this one: the upheld dispute above slashed
+        // attester1's bond and forfeited challenger1's, each its own punishment.
+        bytes32 id2 = _submit();
+        _sign(id2, attester2);
+        vm.prank(outsider);
+        glt.challengeAttestation(id2, "b");
+        _skipWindow();
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, expected, CURATOR_BOND));
+        glt.castCuratorVote(id2, true);
+    }
+
+    /// The escape this whole mechanism exists to close: bond, rule, deactivate, withdraw, and
+    /// be immune when the ruling you voted for turns out to be the losing one.
+    function test_CannotWithdrawBondToEscapeTheSlash() public {
+        // 50%, so a remainder survives the slash and can actually be reclaimed afterwards.
+        vm.prank(owner);
+        glt.setCuratorSlashBps(5_000);
+
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false); // dissenter
+        assertEq(glt.curatorOpenVotes(curator1), 1, "vote locks the bond");
+
+        // Deactivation alone must not release it.
+        vm.prank(owner);
+        glt.deactivateCurator(curator1);
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.CuratorHasOpenVotes.selector, curator1, 1));
+        glt.withdrawCuratorBond();
+
+        vm.prank(curator2);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator3);
+        glt.castCuratorVote(id, true);
+        glt.tallyDispute(id);
+
+        // Settled, so the lock is gone and the slash has actually landed.
+        assertEq(glt.curatorOpenVotes(curator1), 0, "lock released at settlement");
+        uint256 remainder = CURATOR_BOND / 2;
+        assertEq(glt.curatorBond(curator1), remainder, "escaped nothing: half was burned");
+        _solvent();
+
+        vm.prank(curator1);
+        glt.withdrawCuratorBond();
+        assertEq(glt.balanceOf(curator1), CURATOR_BOND + remainder, "bond + 50% slash, nothing more");
+    }
+
+    /// Still-active curators cannot pull their bond, so a curator cannot exit ahead of a
+    /// dispute they are about to be asked to rule on.
+    function test_RevertWhen_ActiveCuratorWithdrawsBond() public {
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.CuratorStillActive.selector, curator1));
+        glt.withdrawCuratorBond();
+    }
+
+    /// A curatorship that can be made free again reinstates the exact panel the bond removes.
+    function test_RevertWhen_CuratorBondSetToZero() public {
+        vm.prank(owner);
+        vm.expectRevert(GalacticTrust.ZeroAmount.selector);
+        glt.setCuratorBondAmount(0);
+    }
+
+    /// How expiry interacts with a REFUTED verdict, pinned because the answer is not obvious and is
+    /// load-bearing. Silence punishes the submitter; a panel that actually voted to acquit does
+    /// not — and the curators who acquit it are not slashed, because they agreed with the ruling.
+    function test_RefutedExpirySparesASubmitterThePanelAcquitted() public {
+        v.setVerdict(EvidenceVerdict.REFUTED);
+
+        // (a) no curator votes at all: silence is not acquittal, the submitter is punished.
+        bytes32 quiet = _submit();
+        _sign(quiet, attester1);
+        _skipWindow();
+        _expire();
+        glt.expireReview(quiet);
+        assertEq(uint8(glt.getAttestation(quiet).status), uint8(GalacticTrust.AttestationStatus.SLASHED));
+
+        // (b) the panel votes to acquit: the humans overrule the machine, visibly.
+        // `tallyDispute`, not `expireReview` — a panel that reaches quorum with a clear
+        // non-tie is settled by ruling, and `expireReview` deliberately refuses that case.
+        // attester2 again: the upheld expiry above slashed attester1's bond to nothing.
+        bytes32 id = _submit();
+        _sign(id, attester2);
+        _skipWindow();
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        glt.tallyDispute(id);
+
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.PENDING));
+        assertEq(glt.getAttestation(id).stake, MIN_STAKE, "stake returned: the panel spoke");
+        assertTrue(glt.getAttestation(id).panelOverride, "the override is recorded, which is what makes it finalizable");
+        assertEq(glt.curatorBond(curator1), CURATOR_BOND, "acquitting the panel agreed with the ruling");
+        assertEq(glt.curatorBond(curator2), CURATOR_BOND, "so it is not a loser's slash");
+        _solvent();
+    }
+
+    /// The `finalizeAttestation` release path. A curator may rule on a referral with no
+    /// challenger; if the verifier is then repaired the attestation finalizes normally, and
+    /// those abandoned votes must not leave a lock nothing will ever clear.
+    function test_AbandonedReferralVotesReleaseTheirLockOnFinalize() public {
+        v.setVerdict(EvidenceVerdict.UNRESOLVED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        // reviewable with no challenger at all, because the verdict is not CONFIRMED
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        assertEq(glt.curatorOpenVotes(curator1), 1);
+
+        // the proof system comes back
+        v.setVerdict(EvidenceVerdict.CONFIRMED);
+        glt.finalizeAttestation(id);
+
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.FINALIZED));
+        assertEq(glt.curatorOpenVotes(curator1), 0, "lock released, not stranded");
+        assertEq(glt.curatorBond(curator1), CURATOR_BOND, "and no slash: the votes were abandoned, not overruled");
+        _solvent();
+
+        // the curator is a free agent again and can withdraw
+        vm.prank(owner);
+        glt.deactivateCurator(curator1);
+        vm.prank(curator1);
+        glt.withdrawCuratorBond();
+    }
+
+    /// A settled attestation must not be re-ruled. `upholdWeight`/`rejectWeight` persist past
+    /// settlement, so allowing a second ballot would let a curator stack a vote onto a decided
+    /// tally and flip an acquittal into a slash.
+    function test_CannotReVoteAfterSettlementToFlipARuling() public {
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator3);
+        glt.castCuratorVote(id, false);
+        glt.tallyDispute(id);
+
+        // Rejected. The submitter is exonerated and the attestation can finalize.
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.PENDING));
+        assertEq(glt.getAttestation(id).stake, MIN_STAKE, "stake intact");
+
+        // The rejection cleared the challenger list, so there is nothing left to rule on. This
+        // guard fires ahead of `AlreadyVoted`, and it is the one that matters here: the panel
+        // already ruled and the evidence is now unchallenged.
+        vm.prank(curator3);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NoChallengesToResolve.selector, id));
+        glt.castCuratorVote(id, true);
+
+        // Nor can anyone who already did, in the direction that would have overturned it.
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NoChallengesToResolve.selector, id));
+        glt.castCuratorVote(id, true);
+
+        assertEq(glt.getAttestation(id).stake, MIN_STAKE, "no second ruling reached the submitter");
+        _solvent();
+    }
+
+    /// Within an open dispute the ballot is spent for good, so a curator cannot hedge by
+    /// voting both ways before the tally.
+    function test_RevertWhen_CuratorVotesTwiceOnAnOpenDispute() public {
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AlreadyVoted.selector, id, curator1));
+        glt.castCuratorVote(id, false);
+
+        assertEq(glt.curatorOpenVotes(curator1), 1, "one vote, one lock");
         _solvent();
     }
 }

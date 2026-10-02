@@ -51,6 +51,7 @@ contract GalacticTrustTest is Test {
     uint256 internal constant REWARD = 100e18;
     uint256 internal constant TREASURY = 1_000_000e18;
     uint256 internal constant CHALLENGE_BOND = 100e18;
+    uint256 internal constant CURATOR_BOND = 1_000e18;
 
     function setUp() public {
         glt = new GalacticTrust(owner, MIN_STAKE, address(0), TREASURY, submitter);
@@ -68,6 +69,7 @@ contract GalacticTrustTest is Test {
         glt.setRewardAmount(REWARD);
         glt.setAttesterBondAmount(BOND);
         glt.setChallengeBondAmount(CHALLENGE_BOND);
+        glt.setCuratorBondAmount(CURATOR_BOND);
         vm.stopPrank();
 
         _fund(attester1);
@@ -75,6 +77,9 @@ contract GalacticTrustTest is Test {
         _fund(attester3);
         _fundChallenger(challenger);
         _fundChallenger(outsider);
+        _fundCurator(curator1);
+        _fundCurator(curator2);
+        _fundCurator(curator3);
     }
 
     /// @dev Funds attesters from the treasury. No test-only mint exists in the token on purpose.
@@ -92,14 +97,19 @@ contract GalacticTrustTest is Test {
         glt.fundChallengeBond(CHALLENGE_BOND);
     }
 
+    /// @dev A curatorship is only meaningful with skin behind it, so every curator in these
+    /// tests is bonded. An unbonded curator cannot cast a weight-bearing vote at all.
+    function _fundCurator(address who) internal {
+        vm.prank(submitter);
+        glt.transfer(who, CURATOR_BOND * 2);
+        vm.prank(who);
+        glt.fundCuratorBond(CURATOR_BOND);
+    }
+
     /// @dev The invariant that makes every other assertion here meaningful: the contract
     /// never owes more than it holds, and never holds more than it owes beyond dust.
     function _assertSolvent() internal {
-        assertGe(
-            glt.balanceOf(address(glt)),
-            glt.totalLiabilities(),
-            "contract owes more than it holds"
-        );
+        assertGe(glt.balanceOf(address(glt)), glt.totalLiabilities(), "contract owes more than it holds");
     }
 
     /// @dev Two of three curators uphold, which clears the 50% curator quorum.
@@ -141,9 +151,7 @@ contract GalacticTrustTest is Test {
     /// timestamp between calls, so reusing SECRET would collide and overwrite the record.
     function _submitDistinct(bytes32 secret) internal returns (bytes32 id) {
         vm.prank(submitter);
-        id = glt.submitAttestation(
-            keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2
-        );
+        id = glt.submitAttestation(keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2);
     }
 
     function _skipWindow() internal {
@@ -206,7 +214,11 @@ contract GalacticTrustTest is Test {
         GalacticTrust.Attestation memory att = glt.getAttestation(id);
         assertEq(uint8(att.status), uint8(GalacticTrust.AttestationStatus.PENDING));
         assertEq(att.stake, MIN_STAKE);
-        assertEq(glt.balanceOf(address(glt)), BOND * 3 + CHALLENGE_BOND * 2 + MIN_STAKE, "bonds + challenge bonds + stake");
+        assertEq(
+            glt.balanceOf(address(glt)),
+            BOND * 3 + CHALLENGE_BOND * 2 + CURATOR_BOND * 3 + MIN_STAKE,
+            "bonds + challenge bonds + curator bonds + stake"
+        );
         assertEq(att.challengeDeadline, block.timestamp + glt.CHALLENGE_WINDOW());
     }
 
@@ -312,9 +324,7 @@ contract GalacticTrustTest is Test {
         vm.prank(attester1);
         glt.signAttestation(id);
         _skipWindow();
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.QuorumNotReached.selector, id, 100, 150)
-        );
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.QuorumNotReached.selector, id, 100, 150));
         glt.finalizeAttestation(id);
     }
 
@@ -331,7 +341,11 @@ contract GalacticTrustTest is Test {
 
         assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.FINALIZED));
         assertEq(glt.balanceOf(submitter), before + MIN_STAKE + REWARD, "stake returned + reward minted");
-        assertEq(glt.balanceOf(address(glt)), BOND * 3 + CHALLENGE_BOND * 2, "attester + challenge bonds remain");
+        assertEq(
+            glt.balanceOf(address(glt)),
+            BOND * 3 + CHALLENGE_BOND * 2 + CURATOR_BOND * 3,
+            "attester + challenge + curator bonds remain"
+        );
     }
 
     function test_RevertWhen_DoubleFinalize() public {
@@ -420,11 +434,7 @@ contract GalacticTrustTest is Test {
 
         assertEq(glt.attesterBond(attester1), 0, "signer bond slashed");
         assertEq(glt.attesterBond(attester2), 0, "signer bond slashed");
-        assertEq(
-            glt.totalSupply(),
-            supplyBefore - MIN_STAKE - (BOND * 2),
-            "submitter stake + both signer bonds burned"
-        );
+        assertEq(glt.totalSupply(), supplyBefore - MIN_STAKE - (BOND * 2), "submitter stake + both signer bonds burned");
     }
 
     function test_NonSigningAttesterKeepsBond() public {
@@ -502,9 +512,7 @@ contract GalacticTrustTest is Test {
         _skipWindow();
         vm.prank(curator1);
         glt.castCuratorVote(id, true);
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.CuratorQuorumNotReached.selector, id, 100, 150)
-        );
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.CuratorQuorumNotReached.selector, id, 100, 150));
         glt.tallyDispute(id);
     }
 
@@ -616,9 +624,7 @@ contract GalacticTrustTest is Test {
         bytes32 id = _submit();
         address unbonded = makeAddr("unbonded-challenger");
         vm.prank(unbonded);
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, 0, CHALLENGE_BOND)
-        );
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, 0, CHALLENGE_BOND));
         glt.challengeAttestation(id, "free challenge");
     }
 
@@ -630,9 +636,7 @@ contract GalacticTrustTest is Test {
         vm.prank(challenger);
         glt.claimChallengeReward(id);
         vm.prank(challenger);
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.ClaimAlreadyMade.selector, id, challenger)
-        );
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.ClaimAlreadyMade.selector, id, challenger));
         glt.claimChallengeReward(id);
     }
 
@@ -644,9 +648,7 @@ contract GalacticTrustTest is Test {
         glt.challengeAttestation(id, "wrong call");
         _resolveDown(id);
         vm.prank(challenger);
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.NothingToClaim.selector, id, challenger)
-        );
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NothingToClaim.selector, id, challenger));
         glt.claimChallengeReward(id);
     }
 
@@ -711,9 +713,7 @@ contract GalacticTrustTest is Test {
         _signTwo(id);
         _skipWindow();
         vm.expectRevert(
-            abi.encodeWithSelector(
-                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.REFUTED)
-            )
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.REFUTED))
         );
         glt.finalizeAttestation(id);
         _assertSolvent();
@@ -728,9 +728,7 @@ contract GalacticTrustTest is Test {
         _skipWindow();
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED)
-            )
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
         );
         glt.finalizeAttestation(id);
 
@@ -751,9 +749,7 @@ contract GalacticTrustTest is Test {
         assertEq(uint8(glt.evidenceVerdict(id)), uint8(EvidenceVerdict.UNRESOLVED));
         _skipWindow();
         vm.expectRevert(
-            abi.encodeWithSelector(
-                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED)
-            )
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
         );
         glt.finalizeAttestation(id);
     }
@@ -1040,7 +1036,7 @@ contract GalacticTrustTest is Test {
         glt.recoverExcessStake(MIN_STAKE);
         _assertSolvent();
 
-vm.warp(block.timestamp + glt.CHALLENGE_WINDOW() + 1);
+        vm.warp(block.timestamp + glt.CHALLENGE_WINDOW() + 1);
         vm.prank(attester1);
         glt.signAttestation(id);
         vm.prank(attester2);
@@ -1156,7 +1152,9 @@ vm.warp(block.timestamp + glt.CHALLENGE_WINDOW() + 1);
 
         address nobody = makeAddr("nobody");
         vm.prank(nobody);
-        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, 0, fresh.challengeBondAmount()));
+        vm.expectRevert(
+            abi.encodeWithSelector(GalacticTrust.BondBelowRequired.selector, 0, fresh.challengeBondAmount())
+        );
         fresh.challengeAttestation(id, "free grief");
     }
 

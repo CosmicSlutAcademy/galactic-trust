@@ -21,12 +21,24 @@ contract FuzzTest is Test {
 
     uint256 internal constant MIN_STAKE = 1_000e18;
     uint256 internal constant TREASURY = 1_000_000e18;
+    uint256 internal constant CURATOR_BOND = 1_000e18;
 
     function setUp() public {
         glt = new GalacticTrust(owner, MIN_STAKE, address(0), TREASURY, submitter);
         glt.registerCurator(curator1, 100);
         glt.registerCurator(curator2, 100);
         glt.registerCurator(curator3, 100);
+        glt.setCuratorBondAmount(CURATOR_BOND);
+        _fundCurator(curator1);
+        _fundCurator(curator2);
+        _fundCurator(curator3);
+    }
+
+    function _fundCurator(address who) internal {
+        vm.prank(submitter);
+        glt.transfer(who, CURATOR_BOND * 2);
+        vm.prank(who);
+        glt.fundCuratorBond(CURATOR_BOND);
     }
 
     /// @dev Convenience alias. `Test` already exposes `bound`; the indirection keeps the call
@@ -68,9 +80,8 @@ contract FuzzTest is Test {
 
         bytes32 secret = keccak256(abi.encode(bondSeed, slashSeed));
         vm.prank(submitter);
-        bytes32 id = glt.submitAttestation(
-            keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2
-        );
+        bytes32 id =
+            glt.submitAttestation(keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2);
 
         // a fuzzed subset of signers, capped so quorum may or may not be met
         uint256 nSigners = _fuzzBound(attesterSeed, 0, 3);
@@ -101,10 +112,7 @@ contract FuzzTest is Test {
 
     /// @dev Every challenger must be able to pull, and the pool must end empty. This is the
     /// conservation-of-payouts half, which the single-pool bug violated silently.
-    function testFuzz_AllChallengersPaidExactlyOnce(
-        uint256 nRaw,
-        uint256 slashSeed
-    ) public {
+    function testFuzz_AllChallengersPaidExactlyOnce(uint256 nRaw, uint256 slashSeed) public {
         uint256 n = _fuzzBound(nRaw, 1, 8);
         uint256 slashBps = _fuzzBound(slashSeed, 0, 10_000);
         uint256 bond = 10e18;
@@ -117,9 +125,8 @@ contract FuzzTest is Test {
 
         bytes32 secret = keccak256("fuzz-payouts");
         vm.prank(submitter);
-        bytes32 id = glt.submitAttestation(
-            keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2
-        );
+        bytes32 id =
+            glt.submitAttestation(keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2);
 
         address[] memory cs = new address[](n);
         for (uint256 i = 0; i < n; i++) {
@@ -165,9 +172,8 @@ contract FuzzTest is Test {
 
         bytes32 secret = keccak256(abi.encode("exp", pattern));
         vm.prank(submitter);
-        bytes32 id = glt.submitAttestation(
-            keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2
-        );
+        bytes32 id =
+            glt.submitAttestation(keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2);
 
         address c = makeAddr("cx");
         vm.prank(submitter);
@@ -202,8 +208,7 @@ contract FuzzTest is Test {
 
         GalacticTrust.AttestationStatus s = glt.getAttestation(id).status;
         assertTrue(
-            s == GalacticTrust.AttestationStatus.PENDING
-                || s == GalacticTrust.AttestationStatus.FINALIZED
+            s == GalacticTrust.AttestationStatus.PENDING || s == GalacticTrust.AttestationStatus.FINALIZED
                 || s == GalacticTrust.AttestationStatus.SLASHED,
             "terminal state reached"
         );
@@ -232,6 +237,84 @@ contract FuzzTest is Test {
         }
     }
 
+    /// @dev The curator slash is the one burn path the other properties never reach. Every
+    /// other fuzz case either has all voting curators agreeing with the ruling or has nobody
+    /// vote at all, so the loser's bond is never touched. This drives a 3-curator split panel
+    /// through both possible rulings and checks the bookkeeping, not just the balance: a burn
+    /// that moves the held total without moving `outstandingCuratorBond` by the same amount
+    /// still satisfies `held >= owed` while being wrong.
+    function testFuzz_CuratorSlashConservesTokens(uint256 slashSeed, uint8 pattern) public {
+        uint256 slashBps = _fuzzBound(slashSeed, 0, 10_000);
+
+        address c = makeAddr(string.concat("slashChallenger", vm.toString(pattern)));
+        vm.startPrank(owner);
+        glt.setChallengeBondAmount(10e18);
+        glt.setCuratorSlashBps(slashBps);
+        glt.setAttesterSlashBps(0); // isolate the curator leg from the attester one
+        vm.stopPrank();
+        vm.prank(submitter);
+        glt.transfer(c, 20e18);
+        vm.prank(c);
+        glt.fundChallengeBond(10e18);
+
+        bytes32 secret = keccak256(abi.encode("slash", pattern, slashSeed));
+        vm.prank(submitter);
+        bytes32 id =
+            glt.submitAttestation(keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2);
+
+        vm.prank(c);
+        glt.challengeAttestation(id, "fuzz");
+        vm.warp(block.timestamp + glt.CHALLENGE_WINDOW() + 1);
+
+        // Three curators, so a 2-1 split reaches the 150 curator quorum and is not a tie. The
+        // dissenter is slashed under p1 and p2, on opposite sides of the ruling.
+        uint256 p = _fuzzBound(pattern, 0, 3);
+        if (p == 0) {
+            _vote(id, curator1, true);
+            _vote(id, curator2, true);
+            _vote(id, curator3, true);
+        } else if (p == 1) {
+            _vote(id, curator1, true);
+            _vote(id, curator2, true);
+            _vote(id, curator3, false);
+        } else if (p == 2) {
+            _vote(id, curator1, false);
+            _vote(id, curator2, false);
+            _vote(id, curator3, true);
+        } else {
+            _vote(id, curator1, false);
+            _vote(id, curator2, false);
+            _vote(id, curator3, false);
+        }
+        glt.tallyDispute(id);
+
+        uint256 expectedLoss = (CURATOR_BOND * slashBps) / 10_000;
+        uint256 dissenterLoss = p == 1 || p == 2 ? expectedLoss : 0;
+        assertEq(
+            glt.curatorBond(curator3),
+            CURATOR_BOND - dissenterLoss,
+            "only the dissenter is shorn, and only by curatorSlashBps"
+        );
+        assertEq(glt.curatorBond(curator1), CURATOR_BOND, "majority intact");
+        assertEq(glt.curatorBond(curator2), CURATOR_BOND, "majority intact");
+
+        // The book, not just the balance.
+        assertEq(
+            glt.outstandingCuratorBond(),
+            glt.curatorBond(curator1) + glt.curatorBond(curator2) + glt.curatorBond(curator3),
+            "outstandingCuratorBond tracks the per-account balances"
+        );
+        assertEq(glt.curatorOpenVotes(curator1), 0, "locks released");
+        assertEq(glt.curatorOpenVotes(curator2), 0, "locks released");
+        assertEq(glt.curatorOpenVotes(curator3), 0, "locks released");
+        _assertSolventFull();
+    }
+
+    function _vote(bytes32 id, address who, bool uphold) internal {
+        vm.prank(who);
+        glt.castCuratorVote(id, uphold);
+    }
+
     /// @dev Solvency must hold at every point, never just at rest.
     function _assertSolvent(bytes32 id, uint256 bond, uint256 slashBps) internal {
         _assertSolventFull();
@@ -242,7 +325,7 @@ contract FuzzTest is Test {
         slashBps;
     }
 
-    function _assertSolventFull() internal {
+    function _assertSolventFull() internal view {
         assertGe(glt.balanceOf(address(glt)), glt.totalLiabilities(), "held >= owed");
     }
 }

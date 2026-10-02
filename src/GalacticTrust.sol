@@ -84,6 +84,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     error NoBondToWithdraw();
     error NotCurator(address account);
     error CuratorInactive(address account);
+    error CuratorStillActive(address account);
+    error CuratorHasOpenVotes(address account, uint256 votes);
+    error TooManyCurators(bytes32 id);
     error AlreadyVoted(bytes32 id, address curator);
     error CuratorVoteTooEarly(bytes32 id);
     error CuratorQuorumNotReached(bytes32 id, uint256 have, uint256 need);
@@ -106,11 +109,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     event AttesterWeightUpdated(address indexed account, uint128 weight);
     event AttesterDeactivated(address indexed account);
     event AttestationSubmitted(
-        bytes32 indexed id,
-        address indexed submitter,
-        bytes32 contentHash,
-        EvidenceTier tier,
-        uint256 stake
+        bytes32 indexed id, address indexed submitter, bytes32 contentHash, EvidenceTier tier, uint256 stake
     );
     event AttestationSigned(bytes32 indexed id, address indexed attester, uint128 weight);
     event AttestationFinalized(bytes32 indexed id, address indexed submitter, uint256 reward);
@@ -123,6 +122,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     event AttesterBondWithdrawn(address indexed account, uint256 amount);
     event CuratorRegistered(address indexed account, uint128 weight);
     event CuratorDeactivated(address indexed account);
+    event CuratorBondFunded(address indexed account, uint256 amount);
+    event CuratorBondWithdrawn(address indexed account, uint256 amount);
+    event CuratorSlashed(bytes32 indexed id, address indexed curator, uint256 amount);
     event CuratorVoted(bytes32 indexed id, address indexed curator, bool uphold, uint128 weight);
     event Disputed(bytes32 indexed id, uint256 upholdWeight, uint256 rejectWeight);
     event ChallengeRewardClaimed(bytes32 indexed id, address indexed account, uint256 amount);
@@ -142,6 +144,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     /// @dev Hard caps so settlement cost is bounded regardless of committee size.
     uint256 public constant MAX_SIGNERS = 50;
     uint256 public constant MAX_CHALLENGERS = 50;
+    uint256 public constant MAX_CURATORS = 50;
 
     IVerifier public verifier;
     uint256 public quorumBps = 5_000;
@@ -152,6 +155,13 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     uint256 public attesterBondAmount = 100e18;
     uint256 public attesterSlashBps = 10_000;
 
+    /// @dev A curatorship must cost skin. The panel is no longer advisory: the tri-state gate
+    /// routes every REFUTED and UNRESOLVED verdict to it, so an unbonded panel would make the
+    /// owner's appointment the whole of the trust model. Defaults are non-zero for the same
+    /// reason the attester and challenge bonds are — a zero default reinstates free ruling.
+    uint256 public curatorBondAmount = 1_000e18;
+    uint256 public curatorSlashBps = 10_000;
+
     mapping(address => Attester) private _attesters;
     mapping(bytes32 => Attestation) private _attestations;
     mapping(bytes32 => mapping(address => bool)) public hasSigned;
@@ -161,7 +171,18 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     mapping(address => uint256) public attesterBond;
     mapping(bytes32 => bool) public disputeUpheld;
     mapping(address => Attester) private _curators;
-    mapping(bytes32 => mapping(address => bool)) public curatorVote;
+
+    /// @dev Tri-state ballot: 0 = has not voted, 1 = uphold, 2 = reject. One bool cannot carry
+    /// both "has voted" and "which way", and slashing the losing side needs the direction, so
+    /// the two states are folded into a single slot.
+    mapping(bytes32 => mapping(address => uint8)) public curatorBallot;
+    mapping(bytes32 => address[]) public curatorVoters;
+
+    /// @dev Votes cast by this curator that have not yet been settled. Non-zero blocks bond
+    /// withdrawal, closing the bond -> rule -> withdraw escape that would otherwise make the
+    /// curator slashing leg uncollectable.
+    mapping(address => uint256) public curatorOpenVotes;
+    mapping(address => uint256) public curatorBond;
     mapping(bytes32 => uint128) public upholdWeight;
     mapping(bytes32 => uint128) public rejectWeight;
     mapping(bytes32 => mapping(address => bool)) public hasClaimed;
@@ -189,6 +210,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     uint256 public totalPayoutEscrow;
     uint256 public outstandingAttesterBond;
     uint256 public outstandingChallengeBond;
+    uint256 public outstandingCuratorBond;
 
     modifier onlyAttester() {
         Attester storage a = _attesters[msg.sender];
@@ -312,6 +334,44 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         return (totalCuratorWeight * quorumBps) / BPS_DENOMINATOR;
     }
 
+    /// @dev Rejects zero, for the same reason `setChallengeBondAmount` does: a curatorship that
+    /// costs nothing restores the exact owner-controlled panel the bond exists to remove.
+    function setCuratorBondAmount(uint256 amount) external onlyOwner {
+        if (amount == 0) revert ZeroAmount();
+        curatorBondAmount = amount;
+    }
+
+    function setCuratorSlashBps(uint256 bps) external onlyOwner {
+        require(bps <= BPS_DENOMINATOR, "slash > 100%");
+        curatorSlashBps = bps;
+    }
+
+    /// @notice Locks GLT as a curatorship bond. Required before a curator's vote carries weight.
+    function fundCuratorBond(uint256 amount) external nonReentrant onlyCurator {
+        uint256 bal = balanceOf(msg.sender);
+        if (bal < amount) revert InsufficientStake(bal, amount);
+        _update(msg.sender, address(this), amount);
+        curatorBond[msg.sender] += amount;
+        outstandingCuratorBond += amount;
+        emit CuratorBondFunded(msg.sender, amount);
+    }
+
+    /// @notice Reclaims the bond. Requires deactivation *and* no unsettled votes, so a curator
+    /// cannot bond, rule, deactivate, and withdraw before the dispute that would have slashed
+    /// them resolves. Deactivation alone is not enough precisely because it is reversible by
+    /// the owner and immediate in effect.
+    function withdrawCuratorBond() external nonReentrant {
+        if (_curators[msg.sender].active) revert CuratorStillActive(msg.sender);
+        uint256 open = curatorOpenVotes[msg.sender];
+        if (open > 0) revert CuratorHasOpenVotes(msg.sender, open);
+        uint256 amount = curatorBond[msg.sender];
+        if (amount == 0) revert NoBondToWithdraw();
+        curatorBond[msg.sender] = 0;
+        outstandingCuratorBond -= amount;
+        _update(address(this), msg.sender, amount);
+        emit CuratorBondWithdrawn(msg.sender, amount);
+    }
+
     /// @notice Deposits GLT that is forfeited if a challenge turns out to be frivolous.
     function fundChallengeBond(uint256 amount) external nonReentrant {
         uint256 bal = balanceOf(msg.sender);
@@ -367,10 +427,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         return _attesters[account];
     }
 
-    function attestation(bytes32 id) external view returns (Attestation memory) {
-        return _attestations[id];
-    }
-
+    /// @dev Single source of truth. An identical `attestation()` getter existed alongside this
+    /// one "for ergonomics" and cost bytecode in a contract with 1,425 B of EIP-170 margin;
+    /// `getAttestation` is kept as the name because it is what every caller and test uses.
     function getAttestation(bytes32 id) external view returns (Attestation memory) {
         return _attestations[id];
     }
@@ -423,8 +482,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (att.status != AttestationStatus.PENDING) revert AttestationNotPending(id);
         if (hasSigned[id][msg.sender]) revert AlreadyAttested(id, msg.sender);
         uint256 bond = attesterBond[msg.sender];
-        if (bond < attesterBondAmount)
+        if (bond < attesterBondAmount) {
             revert BondBelowRequired(bond, attesterBondAmount);
+        }
         Attester storage a = _attesters[msg.sender];
         if (signers[id].length >= MAX_SIGNERS) revert TooManySigners(id);
         hasSigned[id][msg.sender] = true;
@@ -446,14 +506,28 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         EvidenceVerdict verdict = _verdict(att);
         // A panel may deliberately override a REFUTED/UNRESOLVED referral. A CONFIRMED verdict
         // with a rejected referral is already covered by `panelOverride` being false.
-        if (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride)
+        if (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride) {
             revert EvidenceNotFinalizable(id, uint8(verdict));
-        if (att.attestationWeight < att.quorumWeight)
+        }
+        if (att.attestationWeight < att.quorumWeight) {
             revert QuorumNotReached(id, att.attestationWeight, att.quorumWeight);
+        }
+        // A curator can vote on a referral with no challenger, and the referral can then become
+        // CONFIRMED — a repaired verifier, say — letting the attestation finalize through the
+        // normal path with those votes never settled. Releasing here stops that from stranding
+        // a curator's bond behind a lock nothing will ever clear.
+        _settleCurators(id, false, false);
         att.status = AttestationStatus.FINALIZED;
         if (att.stake > 0) {
             totalStaked -= att.stake;
             _update(address(this), att.submitter, att.stake);
+            // Clear the record, not just the book. `_penalise` does this and finalization did
+            // not, so a FINALIZED attestation went on reporting its stake forever after the
+            // tokens were returned. Solvency was never at risk — `totalLiabilities()` reads
+            // `totalStaked`, which was already correct — but the public attestation lied, and
+            // anything integrating against `stake` would over-count. Caught by
+            // `invariant_TerminalAttestationsRetainNoStake`.
+            att.stake = 0;
         }
         _mint(att.submitter, rewardAmount);
         emit AttestationFinalized(id, att.submitter, rewardAmount);
@@ -466,9 +540,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     function _verdict(Attestation storage att) internal view returns (EvidenceVerdict) {
         address v = address(verifier);
         if (v == address(0)) return EvidenceVerdict.CONFIRMED;
-        try IVerifier(v).verifyEvidence(att.contentHash, uint8(att.tier)) returns (
-            EvidenceVerdict verdict
-        ) {
+        try IVerifier(v).verifyEvidence(att.contentHash, uint8(att.tier)) returns (EvidenceVerdict verdict) {
             return verdict;
         } catch {
             return EvidenceVerdict.UNRESOLVED;
@@ -484,8 +556,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (hasChallenged[id][msg.sender]) revert AlreadyChallenged(id, msg.sender);
         if (challengers[id].length >= MAX_CHALLENGERS) revert TooManyChallengers(id);
         uint256 bond = challengeBond[msg.sender] - lockedChallengeBond[msg.sender];
-        if (bond < challengeBondAmount)
+        if (bond < challengeBondAmount) {
             revert BondBelowRequired(bond, challengeBondAmount);
+        }
         challengeLock[id][msg.sender] = challengeBondAmount;
         lockedChallengeBond[msg.sender] += challengeBondAmount;
         hasChallenged[id][msg.sender] = true;
@@ -502,11 +575,20 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (block.timestamp <= att.challengeDeadline) revert CuratorVoteTooEarly(id);
         // A referral needs no challenger: a REFUTED or UNRESOLVED verdict is reviewable on
         // its own. Rejecting that case here would leave the tri-state gate with no exit.
-        if (challengers[id].length == 0 && _verdict(att) == EvidenceVerdict.CONFIRMED)
+        if (challengers[id].length == 0 && _verdict(att) == EvidenceVerdict.CONFIRMED) {
             revert NoChallengesToResolve(id);
-        if (curatorVote[id][msg.sender]) revert AlreadyVoted(id, msg.sender);
+        }
+        if (curatorBallot[id][msg.sender] != 0) revert AlreadyVoted(id, msg.sender);
+        if (curatorVoters[id].length >= MAX_CURATORS) revert TooManyCurators(id);
+        // Same shape as `signAttestation`: weight means nothing without skin behind it. Without
+        // this gate the owner appoints unbonded curators, quorum is free to reach, and the
+        // panel is the owner's key wearing a committee costume.
+        uint256 bond = curatorBond[msg.sender];
+        if (bond < curatorBondAmount) revert BondBelowRequired(bond, curatorBondAmount);
         Attester storage c = _curators[msg.sender];
-        curatorVote[id][msg.sender] = true;
+        curatorBallot[id][msg.sender] = uphold ? 1 : 2;
+        curatorVoters[id].push(msg.sender);
+        curatorOpenVotes[msg.sender] += 1;
         if (uphold) {
             upholdWeight[id] += c.weight;
         } else {
@@ -521,8 +603,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         Attestation storage att = _attestations[id];
         if (att.status != AttestationStatus.PENDING) revert NotPendingOrDisputed(id);
         if (block.timestamp <= att.challengeDeadline) revert CuratorVoteTooEarly(id);
-        if (challengers[id].length == 0 && _verdict(att) == EvidenceVerdict.CONFIRMED)
+        if (challengers[id].length == 0 && _verdict(att) == EvidenceVerdict.CONFIRMED) {
             revert NoChallengesToResolve(id);
+        }
         uint256 up = upholdWeight[id];
         uint256 down = rejectWeight[id];
         // Snapshotted, so the owner cannot move the bar after the dispute is filed.
@@ -563,6 +646,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     function _resolve(bytes32 id, Attestation storage att, bool upheld) internal {
         disputeUpheld[id] = upheld;
         emit Disputed(id, upholdWeight[id], rejectWeight[id]);
+        // Before the attester and challenger legs, because a panel that punishes its own
+        // submitter must be accountable too. Both rulings settle it, not just upheld ones.
+        _settleCurators(id, upheld, true);
         if (upheld) {
             _penalise(id, att);
         } else {
@@ -613,6 +699,45 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             challengeLock[id][c] = 0;
             lockedChallengeBond[c] -= lock;
         }
+    }
+
+    /// @dev Closes out the curator panel for one attestation: slashes every curator who voted
+    /// against the ruling, then releases everyone's vote lock.
+    ///
+    /// The panel majority is ground truth by construction, so a ballot that opposed it is the
+    /// only available signal for a bad ruling. This is the same reasoning as the attester leg
+    /// in `_penalise`: without it a curator could rule arbitrarily forever, because nothing
+    /// downstream ever disagreed with them.
+    ///
+    /// `penalise` is false on the plain finalization path, which reaches settlement without ever
+    /// ruling. There the votes are abandoned rather than overruled, so slashing anyone would
+    /// punish curators for an attestation that was simply never disputed.
+    ///
+    /// The ballot is deliberately NOT cleared, so `AlreadyVoted` holds for the life of the
+    /// attestation. `upholdWeight` and `rejectWeight` are never reset at settlement either, so a
+    /// cleared ballot would let a curator stack a second vote on top of a tally that was already
+    /// decided — enough to flip a rejection into an uphold and `_penalise` a submitter the panel
+    /// had just exonerated, with no challenger anywhere in the picture.
+    function _settleCurators(bytes32 id, bool upheld, bool penalise) internal {
+        address[] storage cv = curatorVoters[id];
+        uint256 n = cv.length;
+        for (uint256 i = 0; i < n;) {
+            address c = cv[i];
+            if (penalise && (curatorBallot[id][c] == 1) != upheld) {
+                uint256 pen = (curatorBond[c] * curatorSlashBps) / BPS_DENOMINATOR;
+                if (pen > 0) {
+                    curatorBond[c] -= pen;
+                    outstandingCuratorBond -= pen;
+                    _burn(address(this), pen);
+                    emit CuratorSlashed(id, c, pen);
+                }
+            }
+            if (curatorOpenVotes[c] > 0) curatorOpenVotes[c] -= 1;
+            unchecked {
+                ++i;
+            }
+        }
+        _clear(cv);
     }
 
     /// @dev Burns the submitter's stake, slashes every attester who certified the fabrication,
@@ -702,7 +827,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
 
     /// @notice Verifies a candidate pre-image against the committed content hash. Stateless: it
     /// records nothing, so a wrong guess costs the caller a transaction and nothing else.
-/// This is the safe form of reveal — compare the returned flag rather than trusting storage.
+    /// This is the safe form of reveal — compare the returned flag rather than trusting storage.
     function checkSecret(bytes32 id, bytes32 candidate) external view returns (bool valid) {
         Attestation storage att = _attestations[id];
         return keccak256(abi.encode(candidate, att.submitter)) == att.contentHash;
@@ -721,8 +846,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (att.status == AttestationStatus.SLASHED) revert AttestationNotFinalized(id);
         if (att.status == AttestationStatus.FINALIZED) revert AttestationNotFinalized(id);
         if (block.timestamp <= att.challengeDeadline) revert ChallengeWindowOpen(id);
-        if (wasChallenger[id][msg.sender] != true && !_isCurator(msg.sender))
+        if (wasChallenger[id][msg.sender] != true && !_isCurator(msg.sender)) {
             revert NotAuthorizedRevealer(id, msg.sender);
+        }
 
         bool valid = keccak256(abi.encode(candidate, att.submitter)) == att.contentHash;
         if (valid) {
@@ -747,7 +873,9 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
 
     /// @notice Total tokens the contract owes to third parties. Never burnable.
     function totalLiabilities() public view returns (uint256) {
-        return totalStaked + totalPayoutEscrow + outstandingAttesterBond + outstandingChallengeBond;
+        return
+            totalStaked + totalPayoutEscrow + outstandingAttesterBond + outstandingChallengeBond
+                + outstandingCuratorBond;
     }
 
     /// @notice Tokens held that no one is owed to. The only thing the owner may burn.
