@@ -5,13 +5,50 @@ libs = ["lib"]
 
 # The optimizer is off by default, which left the runtime bytecode at ~38 KB against the
 # 24,576 B EIP-170 limit, so the contract could not have been deployed at all. Verified with
-# `forge build --sizes`. Turns are pinned low rather than high because higher values traded
-# a few hundred bytes for a large gas regression on the settlement loops.
+# `forge build --sizes`.
 optimizer = true
-optimizer_runs = 200
-# via_ir was measured at 21,703 B runtime (381 B *larger*) than the legacy pipeline at
-# 21,322 B, so it stays off. Margin to EIP-170 is 3,254 B and shrinking as features land —
-# re-check with `forge build --sizes` on every change.
+
+# Measured 2026-10-02 across the settlement-heavy tests. The previous note here claimed high
+# turn counts were pinned "because higher values traded a few hundred bytes for a large gas
+# regression" — that regression does not exist. Lower `optimizer_runs` shrinks the bytecode and
+# costs a little gas, monotonically:
+#
+#   runs      runtime B   EIP-170 margin   settlement gas   vs 200
+#   1           22,516          2,060          7,241,474    +2.03%
+#   20          22,563          2,013          7,130,001    +0.46%   <-- chosen
+#   50          22,701          1,875          7,118,569    +0.30%
+#   100         22,794          1,782          7,111,924    +0.20%
+#   200         23,125          1,451          7,097,582    baseline
+#   999999      29,809         -5,233   UNDEPLOYABLE
+#
+# 20 takes ~95% of the available size win for ~23% of the gas cost; going 20 -> 1 buys 47 B
+# more for another 1.6% gas, which is a bad trade. EIP-170 is a hard deployability cliff and
+# gas is a soft recurring cost, so when the two conflict the cliff wins.
+optimizer_runs = 20
+
+# Re-measured 2026-10-02 on the curator-bond build: via_ir produced 23,382 B runtime, 257 B
+# *larger* than the legacy pipeline's 23,125 B, and took 3m36s to compile instead of seconds.
+# Still off. Re-measure if the contract changes substantially again.
 via_ir = false
+
+# Invariant sweep depth. Foundry's defaults are 256 runs x 500 depth = 128,000 calls per
+# property; across the 7 properties in test/Invariant.t.sol that measured 205 s, far too slow to
+# run on every edit. An invariant suite nobody runs is the same as no suite, so the default is
+# trimmed here and `profile.deep` is what CI and any pre-ship run should use.
+#
+# These must live in an `[invariant]` table. Written as top-level `invariant_runs` /
+# `invariant_depth` they are accepted silently and ignored — verify with `forge config`.
+[invariant]
+runs = 32
+depth = 250
+
+# Full-depth sweep. Run with: FOUNDRY_PROFILE=deep forge test
+[profile.deep]
+[profile.deep.fuzz]
+runs = 2000
+
+[profile.deep.invariant]
+runs = 256
+depth = 500
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
