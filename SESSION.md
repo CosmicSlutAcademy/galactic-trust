@@ -1,11 +1,12 @@
 # SESSION STATE — Galactic-Trust (GLT) / GCIA epistemic ledger
 > Re-read this file first every time you resume. This is the single source of truth for GLT.
 
-**Last updated:** 2026-09-30
+**Last updated:** 2026-10-02
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
-**Location:** `~/galactic-trust` (788 src / 1845 test lines Solidity)
-**Status:** tri-state evidence gate + bypass, escrow accounting, 93/93 tests green
-(4 fuzz suites, verified to 2000 runs), NOT deployed, NOT audited.
+**Location:** `~/galactic-trust` (917 src / 2595 test lines Solidity)
+**Status:** invariant suite, curator bond, escrow accounting, 112/112 tests green
+(default profile 10 s; `deep` profile = 5 fuzz suites at 2000 runs + 7 invariants at
+128,000 calls each), NOT deployed, NOT audited.
 
 ---
 
@@ -15,26 +16,26 @@
 |---|---|
 | Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **needs PATH export, see §3** |
 | `GalacticTrust.sol` | ✅ compiles, quorum attestation + challenge window + slashing |
-| Test suite | ✅ 93/93 passing (78 unit + 11 adversarial + 4 fuzz) |
+| Test suite | ✅ 112/112 passing (78 unit + 22 adversarial + 5 fuzz + 7 invariant) |
 | Tri-state evidence gate | ✅ `CONFIRMED`/`REFUTED`/`UNRESOLVED`, enforced at finalize |
 | Verifier outage failsafe | ✅ a reverting verifier → `UNRESOLVED`, never a protocol halt |
 | Curator quorum snapshot | ✅ snapshotted at submission, owner cannot move it mid-dispute |
 | Dispute tie-break | ✅ `expireReview` after `REVIEW_WINDOW` (7 days), rejects by default |
 | Commit-reveal gating | ✅ post-window, challenger-or-curator only, verify-and-emit |
-| Fuzz/invariant suite | ✅ conservation + multi-challenger payout + expiry terminality |
-| Curator stake behind appointment | ❌ weight still owner-assigned and free — see §6 |
+| Fuzz suite | ✅ conservation + multi-challenger payout + expiry terminality + curator slash |
+| **Invariant handler** | ✅ **7 stateful properties, 15 handler ops — §6.3 closed, found 1 bug** |
+| **Curator stake behind appointment** | ✅ **bonded, locked while voting, loser's bond slashed — §6.1 closed** |
 | Escrow solvency invariant | ✅ `totalLiabilities()` accounted on every movement |
 | Owner burn limited to unbacked balance | ✅ `recoverExcessStake` cannot touch live escrow |
 | Challenge bond locked while challenge open | ✅ `lockedChallengeBond` |
-| Contract size within EIP-170 | ✅ 19,876 B (was 38,446 B — **undeployable before**) |
+| Contract size within EIP-170 | ✅ 22,570 B — 2,006 B margin |
 | Deploy script | ✅ written, untested against a live RPC |
 | Attester bonds + attester slashing | ✅ built and tested |
 | Challenge bonds | ✅ built — required to challenge, forfeited if rejected |
 | Weighted curator panel | ✅ built — `onlyOwner` ruling replaced |
-| Bounded settlement loops | ✅ `MAX_SIGNERS`/`MAX_CHALLENGERS` caps + pull payments |
+| Bounded settlement loops | ✅ `MAX_SIGNERS`/`MAX_CHALLENGERS`/`MAX_CURATORS` caps + pull payments |
 | Access-gating / query fees (pillar 2) | ❌ not built — separate contract |
 | Real ZK verifier | ❌ `IVerifier` is wired and enforced, but no circom verifier exists yet |
-| Curator identity/sybil control | ❌ weight is set by owner, no stake behind a curatorship |
 | Audit | ❌ none |
 | Git remote | ❌ local-only history, single disk — see §6 |
 | Mainnet/testnet deploy | ❌ none |
@@ -101,10 +102,19 @@ slashable, not eliminated. This is the honest version of the design.
 
 ```bash
 cd ~/galactic-trust
-forge test                        # 93/93
-forge test --match-test testFuzz --fuzz-runs 2000
+forge test                        # 112/112, ~10 s   (default profile)
+FOUNDRY_PROFILE=deep forge test   # 112/112, ~213 s  (full sweep, pre-ship)
 forge build --sizes              # MUST stay under 24,576 B EIP-170
 ```
+
+**Two profiles, and the split is deliberate.** The default runs invariants at 32×250 = 8,000
+calls per property so `forge test` stays usable on every edit; `deep` runs 256×500 = 128,000
+calls plus fuzz at 2,000. An invariant suite nobody runs is the same as no suite, so the fast
+default is the honest one and `deep` is what CI and any pre-ship run must use.
+
+⚠️ **`invariant_runs` / `invariant_depth` at the top level of `foundry.toml` are accepted
+silently and ignored.** They must be in an `[invariant]` table as `runs` and `depth`. Verified
+with `forge config | sed -n '/\[invariant\]/,/^$/p'`. Same trap for fuzz: `[fuzz] runs`.
 
 **PATH is already configured** — no manual export needed. It is set in both `~/.bashrc`
 (interactive) and `~/.profile` (login), verified working from both.
@@ -128,7 +138,7 @@ Pinned versions this was built and tested against:
 | Dependency | Version |
 |---|---|
 | foundry | 1.5.1-stable |
-| optimizer | on, 200 runs |
+| optimizer | on, **20 runs** (was 200 — see §5 for the measured size/gas trade) |
 | forge-std | 1.16.2 |
 | openzeppelin-contracts | 5.7.0 |
 | solc | 0.8.33 (auto-installed) |
@@ -143,8 +153,9 @@ Pinned versions this was built and tested against:
 
 ```
 test/GalacticTrust.t.sol    78 unit tests, lifecycle + governance
-test/Adversarial.t.sol     11 tests, hostile owner / broken verifier / tie / no-challenger
-test/Fuzz.t.sol              4 fuzz suites, conservation + terminality
+test/Adversarial.t.sol     22 tests, hostile owner / broken verifier / tie / no-challenger
+test/Fuzz.t.sol              5 fuzz suites, conservation + terminality + curator slash
+test/Invariant.t.sol         7 stateful invariants over a 15-operation handler
 ```
 
 The adversarial and fuzz files are not redundant with the unit suite. Every real bug found in
@@ -160,24 +171,30 @@ the 2026-09-30 audit was invisible to the unit suite and visible to one of the o
 
 ```
 registerAttester()   → fundAttesterBond()      (bond required before signing)
+registerCurator()    → fundCuratorBond()       (bond required before ruling, cannot exit mid-vote)
 submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
   ├─ signAttestation()   ×N attesters, weight accumulates      (capped at MAX_SIGNERS)
   ├─ challengeAttestation() ×N challengers, accumulates       (bond required, capped)
+  ├─ castCuratorVote()    ×N curators, weight accumulates      (bond required, capped,
+  │                                                             dissenters lose bond)
   └─ after window closes:
        ├─ verdict CONFIRMED + quorum + zero challenges
        │      → finalizeAttestation() → stake returned + reward minted
        └─ anything else → curator panel (a REFUTED/UNRESOLVED verdict needs no challenger)
-              ├─ quorum reached, non-tied → tallyDispute() → _resolve():
-              │      uphold → _penalise(): submitter stake burned (slashBps), every
-              │                 signing attester's bond burned, pool = unburned remainder
-              │                 + forfeited challenge bonds, each challenger PULLs its
-              │                 own share via claimChallengeReward()
-              │      reject → _forfeitChallengeBonds() burns challengers' bonds, returns
-              │                to PENDING, can finalize. Against a non-CONFIRMED verdict
-              │                this sets panelOverride — the humans overruling the machine.
-              └─ stalled (tied, or quorum never reached)
-                     → after REVIEW_WINDOW: expireReview() → rejects by default.
-                       A REFUTED verdict is still punished: silence is not acquittal.
+├─ quorum reached, non-tied → tallyDispute() → _resolve():
+               │      every ruling first runs _settleCurators(), which slashes the bond of
+               │      each curator who voted against the majority and frees their vote locks
+               │      uphold → _penalise(): submitter stake burned (slashBps), every
+               │                 signing attester's bond burned, pool = unburned remainder
+               │                 + forfeited challenge bonds, each challenger PULLs its
+               │                 own share via claimChallengeReward()
+               │      reject → _forfeitChallengeBonds() burns challengers' bonds, returns
+               │                to PENDING, can finalize. Against a non-CONFIRMED verdict
+               │                this sets panelOverride — the humans overruling the machine.
+               └─ stalled (tied, or quorum never reached)
+                      → after REVIEW_WINDOW: expireReview() → rejects by default.
+                        A REFUTED verdict is still punished: silence is not acquittal.
+                        Unless the panel actually voted to acquit, which spares the submitter.
 ```
 
 > Every terminal branch is covered by `test/Adversarial.t.sol`, and the conservation property
@@ -194,6 +211,18 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
   reject the challenge the bond is burned, so frivolous challenging has a price.
 - **Curators vote by weight; no single key decides.** A ruling needs curator quorum
   (`curatorQuorumWeight()`, also quorumBps) AND a non-tie. A split stalls rather than guessing.
+- **A curatorship now costs skin.** `fundCuratorBond` locks GLT and `castCuratorVote` refuses a
+  curator below `curatorBondAmount`, mirroring `signAttestation`'s gate on the attester bond.
+  Without it the panel was the owner's key in a committee costume: weight was owner-assigned and
+  free, so appointment was the whole of the trust model and the weighted panel only decentralised
+  the ruling.
+- **A curator who rules against the panel majority loses bond.** `_settleCurators` slashes every
+  dissenter by `curatorSlashBps`, on both rulings. The majority is ground truth by construction,
+  so a ballot opposing it is the only available signal for a bad ruling — the same reasoning as
+  the attester leg in `_penalise`.
+- **A curator cannot escape a slash by exiting.** `curatorOpenVotes` counts unsettled ballots and
+  blocks `withdrawCuratorBond`, so bond → rule → deactivate → withdraw is closed. Deactivation is
+  deliberately *not* sufficient: it is immediate and owner-reversible.
 - **Curator quorum is snapshotted at submission too** (`att.curatorQuorumWeight`), matching
   the attester quorum. It was read live at tally time, so the owner could appoint a whale
   curator mid-dispute and push the bar above reachable weight — verified to freeze the
@@ -221,35 +250,47 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
 - Owner is expected to be a `TimelockController` with `admin = address(0)`.
 - `Ownable2Step` — `transferOwnership` alone leaves one key in control until accepted.
 
-### Contract surface (`src/GalacticTrust.sol`, ~300 lines)
+### Contract surface (`src/GalacticTrust.sol`, ~890 lines)
 
 | Function | Line | Role |
 |---|---|---|
-| `fundAttesterBond` | 233 | lock GLT as signing bond |
-| `withdrawAttesterBond` | 244 | reclaim bond, only after deactivation |
-| `fundChallengeBond` | 289 | lock GLT as challenging bond |
-| `withdrawChallengeBond` | 307 | reclaim only the *unlocked* portion |
-| `submitAttestation` | 364 | lock stake, open window, returns `id` |
-| `signAttestation` | 392 | attester co-sign, accumulates weight |
-| `finalizeAttestation` | 408 | **the mint gate** — quorum + window + zero challenges |
-| `challengeAttestation` | 427 | red-team flag, accumulates, locks bond |
-| `castCuratorVote` | 446 | weighted panel ruling |
-| `tallyDispute` | 464 | applies the ruling once curator quorum is met |
-| `claimChallengeReward` | 594 | per-challenger pull payment |
-| `expireReview` | 543 | forces a stalled dispute after `REVIEW_WINDOW` |
-| `checkSecret` | 706 | stateless read-only hash check, records nothing |
-| `revealSecret` | 719 | post-window, challenger/curator only, verify-and-emit |
-| `evidenceVerdict` | 744 | the machine's tri-state opinion, never reverts |
-| `totalLiabilities` | 626 | every token the contract owes, never burnable |
-| `excessBalance` | 633 | held minus owed — the only burnable amount |
-| `recoverExcessStake` | 641 | burns unbacked balance only |
-| `registerAttester` / `deactivateAttester` | 315 / 331 | committee management |
+| `fundAttesterBond` | 282 | lock GLT as signing bond |
+| `withdrawAttesterBond` | 293 | reclaim bond, only after deactivation |
+| `registerCurator` / `deactivateCurator` | 305 / 321 | panel appointment |
+| `setCuratorBondAmount` / `setCuratorSlashBps` | 339 / 344 | curator bond + dissent penalty |
+| `fundCuratorBond` | 350 | lock GLT as a curatorship bond |
+| `withdrawCuratorBond` | 363 | reclaim, blocked while any vote is unsettled |
+| `fundChallengeBond` | 376 | lock GLT as challenging bond |
+| `withdrawChallengeBond` | 394 | reclaim only the *unlocked* portion |
+| `registerAttester` / `deactivateAttester` | 402 / 418 | committee management |
+| `submitAttestation` | 451 | lock stake, open window, returns `id` |
+| `signAttestation` | 481 | attester co-sign, accumulates weight |
+| `finalizeAttestation` | 501 | **the mint gate** — quorum + window + zero challenges |
+| `challengeAttestation` | 546 | red-team flag, accumulates, locks bond |
+| `castCuratorVote` | 566 | weighted panel ruling, bond-gated |
+| `tallyDispute` | 596 | applies the ruling once curator quorum is met |
+| `expireReview` | 620 | forces a stalled dispute after `REVIEW_WINDOW` |
+| `claimChallengeReward` | 808 | per-challenger pull payment |
+| `checkSecret` | 825 | stateless read-only hash check, records nothing |
+| `revealSecret` | 838 | post-window, challenger/curator only, verify-and-emit |
+| `evidenceVerdict` | 864 | the machine's tri-state opinion, never reverts |
+| `totalLiabilities` | 869 | every token the contract owes, never burnable |
+| `excessBalance` | 878 | held minus owed — the only burnable amount |
+| `recoverExcessStake` | 886 | burns unbacked balance only |
+
+Internal: `_settleCurators` (715) slashes dissenting curators and releases vote locks,
+`_penalise` (743) burns the submitter stake and signing attesters.
 
 Setters: `setVerifier`, `setQuorumBps`, `setMinStake`, `setRewardAmount`, `setSlashBps`,
-`setAttesterBondAmount`, `setAttesterSlashBps`, `setChallengeBondAmount` (all `onlyOwner`;
-the challenge setter rejects zero).
-Getters: `challengeCount`, `signerWeight`, `attesterBond`, `challengeBond`,
-`lockedChallengeBond`, `payoutShare`, `requiredQuorumWeight`, `getAttestation`, `attester`.
+`setAttesterBondAmount`, `setAttesterSlashBps`, `setChallengeBondAmount`, `setCuratorBondAmount`,
+`setCuratorSlashBps` (all `onlyOwner`; both bond setters reject zero).
+Getters: `challengeCount`, `signerWeight`, `attesterBond`, `challengeBond`, `curatorBond`,
+`lockedChallengeBond`, `curatorOpenVotes`, `curatorBallot`, `payoutShare`, `requiredQuorumWeight`,
+`getAttestation`, `attester`, `curator`.
+
+> Bond defaults, all non-zero on purpose: `attesterBondAmount` 100e18, `challengeBondAmount`
+> 100e18, `curatorBondAmount` **1,000e18** (the panel is load-bearing for every REFUTED and
+> UNRESOLVED verdict). `curatorSlashBps` and `attesterSlashBps` both default to 10,000.
 
 > Line numbers drift. Re-derive with
 > `grep -nE "^\s+(function|constructor)" src/GalacticTrust.sol` rather than trusting this table.
@@ -264,6 +305,97 @@ The suite was 47/47 and still shipped four fund-loss bugs, because every test ex
 one challenger, one dispute, and a well-behaved owner. **The bugs were all in the N-user
 and adversarial-owner cases.** Write the adversarial tests first next time: two challengers,
 a hostile owner, an exit mid-dispute. A green suite means the happy path works, nothing more.
+
+### The invariant suite lessons (2026-10-02)
+
+- **It found a real bug on its first run, which is the entire argument for having written it.**
+  `invariant_TerminalAttestationsRetainNoStake` failed: a FINALIZED attestation still reported
+  `stake == 100e18`. `finalizeAttestation` decremented `totalStaked` and returned the tokens but
+  never cleared `att.stake`, while `_penalise` *does* clear it. Solvency was never at risk —
+  `totalLiabilities()` reads `totalStaked`, which was already correct — so all 105 existing tests
+  and all 5 fuzz suites passed straight through it. But the public record lied, and anything
+  integrating against `stake` would have over-counted. This is the mirror image of the
+  `totalStaked` bug below: there the balance was right and the book wrong, here the book was
+  right and the *record* wrong. **An assertion over per-record state catches a class no
+  aggregate invariant can.**
+
+- **The bug was 20 lines from a line already carrying the same logic.** `_penalise` at
+  `totalStaked -= att.stake; att.stake = 0;`, `finalizeAttestation` at `totalStaked -= att.stake;`
+  and nothing after. Symmetry between settlement paths is worth checking explicitly, because the
+  aggregate assertions confirm both are *financially* fine and neither notices that only one
+  updates the record.
+
+- **Handler rules that decide whether the suite is usable.** Two, both learned the hard way:
+  **(1) No handler call may revert** — every external call into GLT is wrapped in `try/catch`,
+  because a reverting handler aborts the entire run and reports it as a handler failure rather
+  than a contract bug. **(2) All handler state must be `internal`** — public state variables
+  generate getters, and the fuzzer calls those alongside the real operations.
+
+- **`forge-std` 1.16.2 has no `FuzzedContract`.** Newer tutorials use
+  `FuzzedContract(address(glt)).addr()`. Here it does not exist; handlers take plain typed params
+  (`uint256 actorSeed, uint256 idSeed`) and the fuzzer binds raw calldata to them. Fine, and it
+  keeps the handler signature readable.
+
+- **Invariant cost is dominated by the checks, not the calls.** Trimming 128,000 calls to 8,000
+  (16x) cut the suite from 205 s to ~10 s only once the config actually took effect — the first
+  attempt looked broken because `invariant_runs` written at the top level was ignored entirely,
+  so the sweep never shrank. **Verify a config change took effect before trusting the timing.**
+
+- **Cap how many ids the handler remembers** (`MAX_TRACKED = 48`). The iterating invariants are
+  O(ids) and ids grow with sequence length, so without a cap every check gets quadratically
+  more expensive. The iterating invariants use `assertLe` rather than equality for the same
+  reason: the book legitimately covers attestations the capped handler never observed.
+
+### The curator bond lessons (2026-10-02)
+
+- **Clearing the ballot at settlement opened a re-ruling exploit.** `_settleCurators` originally
+  reset `curatorBallot[id][c] = 0` so the slot could be reused. But `upholdWeight` and
+  `rejectWeight` are *never* reset at settlement, so a cleared ballot let a curator stack a
+  second vote onto an already-decided tally: three reject votes settle as a rejection, then two
+  of them re-vote uphold and the same attestation tallies as **upheld** — `_penalise` on a
+  submitter the panel had just exonerated, with no challenger anywhere in the picture. The
+  ballot is now permanent for the life of the attestation. **Any per-participant record cleared
+  at settlement must be checked against the aggregates it fed, which are not cleared.**
+
+- **A bond is only real if it cannot be withdrawn before the slash.** The obvious leak was
+  bond → rule → deactivate → withdraw, immune when the ruling turned out to be the losing one.
+  `curatorOpenVotes` counts unsettled ballots and blocks withdrawal. Note deactivation is *not*
+  enough on its own: it is immediate in effect and reversible by the owner, so it is not a
+  commitment to anything.
+
+- **Every terminal path that consumes a vote must release its lock.** A curator may rule on a
+  referral with no challenger (`UNRESOLVED` needs none). If the verifier is then repaired, the
+  attestation finalizes through the normal path and `_resolve` never runs — so the vote lock
+  would be held by nothing that can ever clear it. `finalizeAttestation` calls
+  `_settleCurators(..., penalise = false)`: locks released, nobody slashed, because those votes
+  were *abandoned*, not overruled. **A new exit path needs the same cleanup as the old ones.**
+
+- **Test churn after adding a bond is the feature working, not a regression.** 12 tests failed
+  with `BondBelowRequired(0, 1e21)` on the first run. That is the gate denying unbonded curators,
+  which is the entire point. Every curator in all three setUps now bonds.
+
+- **Reusing a participant after slashing fails in instructive ways.** Once a dispute is upheld,
+  attester1's attester bond is gone and challenger1's challenge bond is forfeited, so a later
+  `_sign(id, attester1)` or `challengeAttestation` reverts on *their* bond, not the thing under
+  test. Five of my new tests failed this way before I switched to the untouched `attester2` /
+  `outsider`. **When a test spans two disputes, use fresh participants for the second one.**
+
+- **`curatorQuorumWeight()` is basis-points of total weight, not the total.** Asserting against
+  `type(uint128).max` + 200 rather than `(type(uint128).max + 300) * 5000 / 10000` fails. Also:
+  `200 + type(uint128).max` is evaluated in **uint128** and overflows — write
+  `uint256(type(uint128).max) + 200`.
+
+- **A panel that reached quorum with a clear non-tie must be settled by `tallyDispute`, not
+  `expireReview`** — the latter reverts `ReviewAlreadyResolved` on purpose. Expiry is only for
+  stalls (no quorum, or a tie).
+
+- **The tri-state gate is tri-state, and the panel can still overrule it — visibly.** On a
+  `REFUTED` verdict: silence at expiry punishes the submitter, but a panel that actually votes
+  to acquit spares them, sets `panelOverride`, and the attestation becomes finalizable. Curators
+  who acquit are *not* slashed, because they agreed with the ruling. Pinned by
+  `test_RefutedExpirySparesASubmitterThePanelAcquitted` so it stays a deliberate property.
+
+### Original 2026-09-30 findings (kept)
 
 - **Anyone could drain the challenge payout pool.** `claimChallengeReward` checked only
   `hasClaimed`, and `_penalise` had already `_clear`ed the challenger list, so the *first*
@@ -318,8 +450,10 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
   token contract is a backdoor. Initial supply is a constructor arg instead
   (`initialSupply`, `treasury`).
 
-- **`attestation()` and `getAttestation()` are duplicates** — left in for ergonomics. Collapse
-  to one before any external integration.
+- **`attestation()` and `getAttestation()` were duplicates** — left in for ergonomics. Collapsed
+  2026-10-02: the bare `attestation()` getter had **zero call sites** across all three test
+  files, so removing it cost nothing and saved 26 B. `getAttestation` is the survivor because it
+  is what all 41 call sites use. Done before any external integration, as intended.
 
 - **Error and event name collision:** `AttestationChallenged` existed as both. Error renamed to
   `AttestationUnderChallenge`. Watch for this when adding members.
@@ -383,11 +517,27 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
 
 - **The contract could not be deployed at all.** 38,446 B runtime against the 24,576 B
   EIP-170 limit, because the optimizer was off and `foundry.toml` never enabled it. Fixed
-  with `optimizer = true` / `optimizer_runs = 200` → and settlement gas *improved*.
-  Now 21,322 B after the tri-state gate (3,254 B margin). `via_ir = true` was measured at
-  21,703 B, i.e. 381 B **worse**, so it stays off. **Run `forge build --sizes` as part of the
-  build, not just `forge test`** — the test suite passes happily on undeployable bytecode.
-  The margin is shrinking with each feature; check it every time.
+  with `optimizer = true`. **Run `forge build --sizes` as part of the build, not just
+  `forge test`** — the test suite passes happily on undeployable bytecode.
+
+  The curator bond then cost 1,829 B on top of that, taking margin from 3,254 B to 1,425 B.
+  Reclaimed on 2026-10-02: dropping the duplicate `attestation()` getter (−26 B, it had **zero**
+  call sites) and `optimizer_runs` 200 → 20 (−536 B). Now **22,563 B, 2,013 B of margin.**
+  See the measured table in `foundry.toml`; re-run `forge build --sizes` on every change.
+
+  - **`optimizer_runs` is a size/gas dial, and it is monotonic.** Measured across the
+    settlement-heavy tests: 200 → 23,125 B / 7,097,582 gas; 20 → 22,563 B / 7,130,001;
+    1 → 22,516 B / 7,241,474; 999999 → 29,809 B and **-5,233 margin, i.e. undeployable.**
+    20 takes ~95% of the size win for ~23% of the gas cost.
+  - **The old `foundry.toml` comment claimed high turns were pinned low because of "a large gas
+    regression" on the settlement loops. That was wrong — the worst case is 2.03%, and 0.46%
+    at the chosen setting.** The claim had been carried across sessions unverified and was
+    costing 536 B of deployability margin. **Do not trust a recorded measurement you have not
+    re-run; this one was wrong in the direction that looked responsible.**
+  - **`via_ir` re-measured and still worse.** 23,382 B vs 23,125 B on the same build (+257 B),
+    and 3m36s to compile instead of seconds. Stays off.
+  - **When EIP-170 margin and gas conflict, EIP-170 wins.** It is a hard cliff that makes the
+    contract undeployable; gas is a soft recurring cost on a token with no real throughput yet.
 
 - **`_resolve` must set `panelOverride` before clearing the challenger list.** It is
   conditional on the *current* verdict and, when there were challenges, on there being none.
@@ -410,6 +560,12 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
   binary on the default PATH. Symptom: `forge test` prints `ZOE ERROR ... unknown option`.
   Found only by testing resume in a clean shell — `forge` was resolving to the wrong program
   the whole time. Both `~/.bashrc` and `~/.profile` now prepend `~/.foundry/bin`.
+  **Re-confirmed 2026-10-02 in a nastier form: the fix only covers *interactive* and *login*
+  shells.** A helper invoked as `bash script.sh` sources neither, so `~/.foundry/bin` never
+  reaches `PATH` and ZOE wins silently — a size/build probe came back as seven consecutive
+  `BUILD FAILED` lines that were never build failures at all. **In any script, call
+  `/home/alexa/.foundry/bin/forge` by absolute path.** Symptom to recognise: `ZOE ERROR ...
+  zoeParseOptions: unknown option`.
 
 - **Do not append to `~/.bashrc` via a shell heredoc.** The layers between PowerShell,
   `wsl.exe` and `bash` expanded `$PATH` during the append, freezing a ~2 KB absolute PATH
@@ -421,33 +577,39 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
 
 ## 6. Next actions, in order
 
-Bugs 4, 5, 7 and 8 were all fixed on 2026-09-30 — see §2 (tri-state gate), §4 (lifecycle),
-and §5 (hard-won lessons). What remains:
+Items 1 (curator bond), 2 (size reclamation) and 3 (invariant handler) were all closed on
+2026-10-02 — see §4, §5 and §1. What remains:
 
-1. ☐ **Put stake behind a curatorship.** Curator weight is assigned by the owner and costs
-   nothing, so the panel is decentralised in *ruling* but not in *appointment*. This is now
-   the single largest remaining gap: the tri-state gate routes every REFUTED and UNRESOLVED
-   verdict to this panel, so its appointment is now load-bearing for the whole design.
-   A curator bond with the same lock-and-slash treatment as `challengeBond` would close it.
-2. ☐ **Add a git remote.** History is local-only, so the whole project dies with the laptop —
-   the exact failure `~/bounty/SESSION.md` opens with. Still the cheapest high-value item.
+1. ☐ **Add a git remote.** History is local-only, so the whole project dies with the laptop —
+   the exact failure `~/bounty/SESSION.md` opens with. The cheapest high-value item on the list
+   and the only one that takes five minutes. **Decided: private.** Blocked on the user for the
+   remote URL — `gh` is not installed and there are no SSH keys. Also pending: the local git
+   identity is a placeholder (`GLOBAL.CYBER.INTELLIGENCE@EMAIL.COM`) and should be corrected
+   before the first push, since commit history is permanent.
+2. ☐ **Reject `deactivateAttester` / `deactivateCurator` on unknown addresses** — they
+   silently succeed today, which hides typos in owner scripts. The invariant handler exercises
+   both, so a regression here will now surface as a weight-total mismatch.
 3. ☐ **Write a circom verifier** implementing `IVerifier`. The interface is tri-state and the
    gate is live; there is still no real proof system behind it. Until one exists, every
    verdict is `CONFIRMED` and the gate is untested in anger. Model the unsolvable case too:
-   a verifier that returns `UNRESOLVED` when a proof is malformed.
-4. ☐ **Add an invariant handler**, not just fuzz. Fuzz samples; `invariant_*` runs on every
-   state transition reachable in one call. `totalLiabilities() <= balanceOf(address(this))`
-   is the one that matters most.
-5. ☐ **Collapse the duplicate `attestation()` / `getAttestation()` getters** (still open).
-6. ☐ **Reject `deactivateAttester` / `deactivateCurator` on unknown addresses** — they
-   silently succeed today, which hides typos in owner scripts.
-7. ☐ **Replace the boilerplate `README.md`** (still the Foundry template). It must state
+   a verifier that returns `UNRESOLVED` when a proof is malformed. Note this needs a
+   circom/snarkjs toolchain and §5 records that WSL has no working Node — probably blocked.
+4. ☐ **Replace the boilerplate `README.md`** (still the Foundry template). It must state
    plainly that GLT asserts *staked testimony*, never truth.
-8. ☐ **Test the deploy script against a local Anvil node**, then a testnet. Both bond amounts
-   now default non-zero, so the script no longer needs to set them.
-9. ☐ **External audit before any mainnet deploy with real value.** Non-negotiable. An
+5. ☐ **Test the deploy script against a local Anvil node**, then a testnet. Both bond amounts
+   now default non-zero, so the script no longer needs to set them — but it *will* need to fund
+   curator bonds before the panel can rule on anything.
+6. ☐ **External audit before any mainnet deploy with real value.** Non-negotiable. An
    unaudited contract that mints a token people pay real money for is not a smaller version of
-   this one, it is a liability.
+   this one, it is a liability. Hand the auditor §5 as the list of what has already gone wrong
+   here; it is a useful map of where to look.
+7. ☐ **Re-check EIP-170 margin before landing each of the above.** 2,006 B is roughly two small
+   features. If one of items 2–5 overruns, take another `optimizer_runs` step down (20 → 1 buys
+   47 B for 1.6% gas) or cut surface before raising the bar.
+8. ☐ **Add a verifier to the invariant fixture.** It currently deploys with `address(0)`, so every
+   verdict is `CONFIRMED` and the panel is reached through challenges rather than referrals.
+   That leaves the REFUTED/UNRESOLVED → panel → `panelOverride` routes unexercised by the
+   stateful suite. Worth doing before the circom work, since it shares the fixture.
 
 ---
 
