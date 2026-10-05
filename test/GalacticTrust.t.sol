@@ -306,6 +306,62 @@ contract GalacticTrustTest is Test {
         glt.withdrawAttesterBond();
     }
 
+    // ---------- owner hygiene: a typo must not read as a success ----------
+
+    /// A silently-succeeding deactivate is the worst failure mode in an owner script: the
+    /// operator sees "done", the whale is still active, and it is still counted in the quorum
+    /// total. The revert names the offending address so the typo is obvious.
+    function test_RevertWhen_DeactivatingAnUnregisteredAttester() public {
+        uint256 weightBefore = glt.totalAttesterWeight();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NotAttester.selector, outsider));
+        glt.deactivateAttester(outsider);
+        assertEq(glt.totalAttesterWeight(), weightBefore, "a failed call must not move the total");
+    }
+
+    function test_RevertWhen_DeactivatingAnUnregisteredCurator() public {
+        uint256 weightBefore = glt.totalCuratorWeight();
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NotCurator.selector, outsider));
+        glt.deactivateCurator(outsider);
+        assertEq(glt.totalCuratorWeight(), weightBefore, "a failed call must not move the total");
+    }
+
+    /// Deactivation stays idempotent for an address that *was* registered. Refusing here would
+    /// be defensible, but the operator running a revoke-all sweep should not have to know in
+    /// advance which entries are already inactive.
+    function test_DeactivationIsIdempotentForRegisteredAddresses() public {
+        vm.startPrank(owner);
+        glt.deactivateAttester(attester1);
+        glt.deactivateAttester(attester1);
+        glt.deactivateCurator(curator1);
+        glt.deactivateCurator(curator1);
+        vm.stopPrank();
+        assertEq(glt.totalAttesterWeight(), 200, "attester1+attester2 remain");
+        assertEq(glt.totalCuratorWeight(), 200, "curator2+curator3 remain");
+        assertFalse(glt.attester(attester1).active);
+        assertFalse(glt.curator(curator1).active);
+    }
+
+    /// The address is the *only* thing that distinguishes a typo from a deliberate call, so the
+    /// error has to carry it. Asserted explicitly: a bare `NotAttester.selector` would satisfy
+    /// `vm.expectRevert` and still tell the operator nothing.
+    function test_DeactivationRevertIdentifiesTheAddress() public {
+        address typo = makeAddr("attestr1");
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.NotAttester.selector, typo));
+        glt.deactivateAttester(typo);
+    }
+
+    function test_DeactivationIsOwnerOnly() public {
+        vm.prank(outsider);
+        vm.expectRevert();
+        glt.deactivateAttester(attester1);
+        vm.prank(outsider);
+        vm.expectRevert();
+        glt.deactivateCurator(curator1);
+    }
+
     // ---------- finalization ----------
 
     function test_RevertWhen_FinalizeBeforeWindowCloses() public {

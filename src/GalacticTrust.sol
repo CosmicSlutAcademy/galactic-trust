@@ -329,8 +329,14 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         emit CuratorRegistered(account, weight);
     }
 
+    /// @dev Rejects an address that was never registered. Deactivating a stranger is a no-op
+    /// that looks like a success, which is the worst possible failure mode in an owner script:
+    /// a typo silently leaves a whale attester or curator active and counted in the quorum
+    /// total, and the operator's next read shows "done". Re-registering an address that is
+    /// already deactivated is still allowed and still idempotent.
     function deactivateCurator(address account) external onlyOwner {
         Attester storage c = _curators[account];
+        if (c.account == address(0)) revert NotCurator(account);
         totalCuratorWeight -= c.weight;
         c.active = false;
         c.weight = 0;
@@ -426,8 +432,12 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         emit AttesterRegistered(account, weight);
     }
 
+    /// @dev Rejects an address that was never registered. See `deactivateCurator`: silently
+    /// succeeding on a typo leaves the address active, still counted in `totalAttesterWeight`,
+    /// and still raising the quorum bar for attestations that have not been submitted yet.
     function deactivateAttester(address account) external onlyOwner {
         Attester storage a = _attesters[account];
+        if (a.account == address(0)) revert NotAttester(account);
         totalAttesterWeight -= a.weight;
         a.active = false;
         a.weight = 0;
