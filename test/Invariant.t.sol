@@ -114,8 +114,6 @@ contract Handler is Test {
         return ids[i];
     }
 
-    
-
     // ---------- operations ----------
 
     /// @dev Distinct secret per call via a monotonic nonce. The id is derived from the submitter,
@@ -230,8 +228,9 @@ contract Handler is Test {
         zeroHashSubmitted = true;
         address a = _actor(0);
         vm.prank(a);
-        try GLT.submitAttestation(bytes32(0), keccak256("zero-hash-probe"), GalacticTrust.EvidenceTier.R3)
-        returns (bytes32 id) {
+        try GLT.submitAttestation(bytes32(0), keccak256("zero-hash-probe"), GalacticTrust.EvidenceTier.R3) returns (
+            bytes32 id
+        ) {
             zeroHashId = id;
         } catch {
             zeroHashSubmitted = false;
@@ -471,16 +470,14 @@ contract InvariantTest is StdInvariant, Test {
             bytes32 id = handler.trackedAt(i);
             if (!glt.getAttestation(id).panelOverride) continue;
             assertGt(
-                glt.rejectWeight(id),
-                glt.upholdWeight(id),
-                "an override was recorded on a ruling that did not reject"
+                glt.rejectWeight(id), glt.upholdWeight(id), "an override was recorded on a ruling that did not reject"
             );
         }
     }
 
     /// @dev An override marks the attestation as human-approved, so a *slashed* one must never carry
     /// it: an integrator reading `panelOverride` would treat a punished submission as approved.
-/// FINALIZED is deliberately allowed, because finalizing is the whole point of the flag.
+    /// FINALIZED is deliberately allowed, because finalizing is the whole point of the flag.
     ///
     /// The first version of this asserted the attestation could never be terminal at all, which
     /// was simply wrong — it failed on the override's intended use. A property that forbids the
@@ -520,9 +517,7 @@ contract InvariantTest is StdInvariant, Test {
         // happen, which is the same "wrong source of truth" mistake one layer up.
         address configured = address(glt.verifier());
         if (configured == address(0)) return;
-        (bool ok, bytes memory ret) = configured.staticcall(
-            abi.encodeCall(IVerifier.verifyEvidence, (bytes32(0), 0))
-        );
+        (bool ok, bytes memory ret) = configured.staticcall(abi.encodeCall(IVerifier.verifyEvidence, (bytes32(0), 0)));
         if (ok && ret.length == 32) return; // the gate has an opinion; nothing to degrade
         assertEq(
             uint8(glt.evidenceVerdict(id)),

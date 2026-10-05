@@ -693,9 +693,7 @@ contract AdversarialTest is Test {
         // And so the mint gate stays shut. This is the part that mattered: without the guard
         // this call succeeded and paid the submitter.
         vm.expectRevert(
-            abi.encodeWithSelector(
-                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED)
-            )
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
         );
         glt.finalizeAttestation(id);
         _solvent();
@@ -713,9 +711,7 @@ contract AdversarialTest is Test {
         glt.expireReview(id);
         assertFalse(glt.getAttestation(id).panelOverride, "nobody voted, so nobody overrode anything");
         vm.expectRevert(
-            abi.encodeWithSelector(
-                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED)
-            )
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
         );
         glt.finalizeAttestation(id);
         _solvent();

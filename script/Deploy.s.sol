@@ -111,10 +111,7 @@ contract Verify is Script {
         require(glt.totalCuratorWeight() > 0, "no curator is appointed");
 
         // Held must cover owed from the first block, before a single attestation exists.
-        require(
-            glt.balanceOf(address(glt)) >= glt.totalLiabilities(),
-            "contract owes more than it holds at deploy"
-        );
+        require(glt.balanceOf(address(glt)) >= glt.totalLiabilities(), "contract owes more than it holds at deploy");
 
         console.log("GLT                  ", address(glt));
         console.log("owner                ", glt.owner());

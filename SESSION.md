@@ -1,12 +1,17 @@
 # SESSION STATE — Galactic-Trust (GLT) / GCIA epistemic ledger
 > Re-read this file first every time you resume. This is the single source of truth for GLT.
 
-**Last updated:** 2026-10-02
+**Last updated:** 2026-10-05
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
-**Location:** `~/galactic-trust` (917 src / 2595 test lines Solidity)
-**Status:** invariant suite, curator bond, escrow accounting, 112/112 tests green
-(default profile 10 s; `deep` profile = 5 fuzz suites at 2000 runs + 7 invariants at
-128,000 calls each), NOT deployed, NOT audited.
+**Location:** `~/galactic-trust` (939 src / 3029 test lines Solidity, 5,153 total)
+**Status:** 125/125 tests green on both profiles (default ~5 s; `deep` = 5 fuzz suites at
+2000 runs + 10 invariants at 128,000 calls each = 145 s), deploy script exercised against
+Anvil, NOT deployed to a public network, NOT audited.
+
+**Read this first if you are resuming.** The referral path was never tested until
+2026-10-05, and finding out why produced three fund-loss bugs plus two properties that
+passed while testing nothing at all. Both lessons are in §5; the short version is that a
+green property is not evidence of anything until you have watched it fail.
 
 ---
 
@@ -16,7 +21,7 @@
 |---|---|
 | Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **needs PATH export, see §3** |
 | `GalacticTrust.sol` | ✅ compiles, quorum attestation + challenge window + slashing |
-| Test suite | ✅ 112/112 passing (78 unit + 22 adversarial + 5 fuzz + 7 invariant) |
+| Test suite | ✅ 125/125 passing (83 unit + 27 adversarial + 5 fuzz + 10 invariant) |
 | Tri-state evidence gate | ✅ `CONFIRMED`/`REFUTED`/`UNRESOLVED`, enforced at finalize |
 | Verifier outage failsafe | ✅ a reverting verifier → `UNRESOLVED`, never a protocol halt |
 | Curator quorum snapshot | ✅ snapshotted at submission, owner cannot move it mid-dispute |
@@ -28,8 +33,14 @@
 | Escrow solvency invariant | ✅ `totalLiabilities()` accounted on every movement |
 | Owner burn limited to unbacked balance | ✅ `recoverExcessStake` cannot touch live escrow |
 | Challenge bond locked while challenge open | ✅ `lockedChallengeBond` |
-| Contract size within EIP-170 | ✅ 22,570 B — 2,006 B margin |
-| Deploy script | ✅ written, untested against a live RPC |
+| Contract size within EIP-170 | ✅ 22,819 B — 1,757 B margin |
+| **Referral path** (`REFUTED`/`UNRESOLVED` → panel → `panelOverride`) | ✅ **now exercised — 3 bugs found and fixed, see §5** |
+| **Panel cannot be re-opened after ruling** | ✅ `panelSettled` — a ruling is final |
+| **`panelOverride` requires a strict reject majority** | ✅ silence and ties no longer grant approval |
+| Deactivation rejects unknown addresses | ✅ `NotAttester`/`NotCurator`, idempotent for real ones |
+| Deploy script | ✅ **exercised end-to-end on Anvil — 2 bugs found, see §5** |
+| Post-deploy verification | ✅ `Deploy.s.sol:Verify`, 8 read-only assertions |
+| README | ✅ real front page, states plainly that GLT asserts *stakes*, never truth |
 | Attester bonds + attester slashing | ✅ built and tested |
 | Challenge bonds | ✅ built — required to challenge, forfeited if rejected |
 | Weighted curator panel | ✅ built — `onlyOwner` ruling replaced |
@@ -102,8 +113,8 @@ slashable, not eliminated. This is the honest version of the design.
 
 ```bash
 cd ~/galactic-trust
-forge test                        # 112/112, ~10 s   (default profile)
-FOUNDRY_PROFILE=deep forge test   # 112/112, ~213 s  (full sweep, pre-ship)
+forge test                        # 125/125, ~5 s    (default profile)
+FOUNDRY_PROFILE=deep forge test   # 125/125, ~145 s  (full sweep, pre-ship)
 forge build --sizes              # MUST stay under 24,576 B EIP-170
 ```
 
@@ -111,6 +122,12 @@ forge build --sizes              # MUST stay under 24,576 B EIP-170
 calls per property so `forge test` stays usable on every edit; `deep` runs 256×500 = 128,000
 calls plus fuzz at 2,000. An invariant suite nobody runs is the same as no suite, so the fast
 default is the honest one and `deep` is what CI and any pre-ship run must use.
+
+**Read the invariant handler table, not just the suite result.** `forge test --match-path
+test/Invariant.t.sol` prints `Calls / Reverts / Discards` per handler operation. Reverts ≈
+calls means the operation is failing silently on every invocation while the suite passes — that
+is what happened to `configureVerifier` for a whole session (§5). This is the one diagnostic
+here that a green run actively hides from you.
 
 ⚠️ **`invariant_runs` / `invariant_depth` at the top level of `foundry.toml` are accepted
 silently and ignored.** They must be in an `[invariant]` table as `runs` and `depth`. Verified
@@ -152,16 +169,23 @@ Pinned versions this was built and tested against:
 ### Test layout — read these before changing the settlement code
 
 ```
-test/GalacticTrust.t.sol    78 unit tests, lifecycle + governance
-test/Adversarial.t.sol     22 tests, hostile owner / broken verifier / tie / no-challenger
+test/GalacticTrust.t.sol    83 unit tests, lifecycle + governance
+test/Adversarial.t.sol      27 tests, hostile owner / broken verifier / tie / no-challenger
 test/Fuzz.t.sol              5 fuzz suites, conservation + terminality + curator slash
-test/Invariant.t.sol         7 stateful invariants over a 15-operation handler
+test/Invariant.t.sol        10 stateful invariants over a 17-operation handler
 ```
 
 The adversarial and fuzz files are not redundant with the unit suite. Every real bug found in
 the 2026-09-30 audit was invisible to the unit suite and visible to one of the other two.
 `forge test --match-test testFuzz --fuzz-runs 2000` before shipping any change to
 `_penalise`, `_resolve`, or the liability counters.
+
+⚠️ **Read the invariant suite's revert column, not just its PASS line.** `forge test
+--match-path test/Invariant.t.sol` prints a per-handler `Calls / Reverts / Discards` table.
+A handler operation with reverts ≈ calls is not running — it is failing silently on every
+single invocation while the suite stays green. That is exactly how `configureVerifier`
+"passed" for a whole session while reverting `OwnableUnauthorizedAccount` 440 times out of
+440 (§5). It is the same failure shape as the 47-green-tests trap, one level down.
 
 ---
 
@@ -188,17 +212,21 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
                │                 signing attester's bond burned, pool = unburned remainder
                │                 + forfeited challenge bonds, each challenger PULLs its
                │                 own share via claimChallengeReward()
-               │      reject → _forfeitChallengeBonds() burns challengers' bonds, returns
-               │                to PENDING, can finalize. Against a non-CONFIRMED verdict
-               │                this sets panelOverride — the humans overruling the machine.
-               └─ stalled (tied, or quorum never reached)
-                      → after REVIEW_WINDOW: expireReview() → rejects by default.
-                        A REFUTED verdict is still punished: silence is not acquittal.
-                        Unless the panel actually voted to acquit, which spares the submitter.
+│      reject → _forfeitChallengeBonds() burns challengers' bonds, returns
+       │                to PENDING, can finalize. Against a non-CONFIRMED verdict
+       │                this sets panelOverride — the humans overruling the machine —
+       │                but ONLY on a strict reject majority (rejectWeight > upholdWeight).
+       │                Silence and ties do not qualify; see §5.
+       │      either ruling sets panelSettled, so no further ballot is accepted.
+       └─ stalled (tied, or quorum never reached)
+              → after REVIEW_WINDOW: expireReview() → rejects by default.
+                A REFUTED verdict is still punished: silence is not acquittal.
+                Unless the panel actually voted to acquit, which spares the submitter.
 ```
 
-> Every terminal branch is covered by `test/Adversarial.t.sol`, and the conservation property
-> by `test/Fuzz.t.sol` — read those before changing anything in `_penalise` or `_resolve`.
+> Every terminal branch is covered by `test/Adversarial.t.sol`, the conservation property by
+> `test/Fuzz.t.sol`, and the referral routes by `test/Invariant.t.sol` — read those before
+> changing anything in `_penalise`, `_resolve`, or `_settleCurators`.
 
 ### Key properties
 
@@ -236,6 +264,12 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
   non-`CONFIRMED` verdict sets `panelOverride`, which is what makes such an attestation
   finalizable at all. Without it the attestation would deadlock permanently: verdict blocks
   finalization, the challenge window is closed, and the curators have all voted.
+  **A strict reject majority is now required** (`rejectWeight > upholdWeight`). Previously any
+  rejection set it, including the default-reject an unattended `expireReview` performs, so
+  silence and ties were recorded as human approval. See §5.
+- **A ruling is final.** `panelSettled[id]` refuses any further ballot once the panel has
+  ruled. Making each curator's own ballot permanent was not enough on its own — other curators
+  could still add weight afterwards. See §5.
 - **Attesters must bond to sign, and cannot withdraw while active.** Prevents bond → certify
   → withdraw before a dispute resolves.
 - **Attesters who sign a fabrication lose their bond.** This closes the colluding-quorum hole:
@@ -254,39 +288,45 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
 
 | Function | Line | Role |
 |---|---|---|
-| `fundAttesterBond` | 282 | lock GLT as signing bond |
-| `withdrawAttesterBond` | 293 | reclaim bond, only after deactivation |
-| `registerCurator` / `deactivateCurator` | 305 / 321 | panel appointment |
-| `setCuratorBondAmount` / `setCuratorSlashBps` | 339 / 344 | curator bond + dissent penalty |
-| `fundCuratorBond` | 350 | lock GLT as a curatorship bond |
-| `withdrawCuratorBond` | 363 | reclaim, blocked while any vote is unsettled |
-| `fundChallengeBond` | 376 | lock GLT as challenging bond |
-| `withdrawChallengeBond` | 394 | reclaim only the *unlocked* portion |
-| `registerAttester` / `deactivateAttester` | 402 / 418 | committee management |
-| `submitAttestation` | 451 | lock stake, open window, returns `id` |
-| `signAttestation` | 481 | attester co-sign, accumulates weight |
-| `finalizeAttestation` | 501 | **the mint gate** — quorum + window + zero challenges |
-| `challengeAttestation` | 546 | red-team flag, accumulates, locks bond |
-| `castCuratorVote` | 566 | weighted panel ruling, bond-gated |
-| `tallyDispute` | 596 | applies the ruling once curator quorum is met |
-| `expireReview` | 620 | forces a stalled dispute after `REVIEW_WINDOW` |
-| `claimChallengeReward` | 808 | per-challenger pull payment |
-| `checkSecret` | 825 | stateless read-only hash check, records nothing |
-| `revealSecret` | 838 | post-window, challenger/curator only, verify-and-emit |
-| `evidenceVerdict` | 864 | the machine's tri-state opinion, never reverts |
-| `totalLiabilities` | 869 | every token the contract owes, never burnable |
-| `excessBalance` | 878 | held minus owed — the only burnable amount |
-| `recoverExcessStake` | 886 | burns unbacked balance only |
+| `fundAttesterBond` | 293 | lock GLT as signing bond |
+| `withdrawAttesterBond` | 304 | reclaim bond, only after deactivation |
+| `registerCurator` / `deactivateCurator` | 316 / 337 | panel appointment; deactivate reverts on unknown |
+| `setCuratorBondAmount` / `setCuratorSlashBps` | 356 / 361 | curator bond + dissent penalty |
+| `fundCuratorBond` | 367 | lock GLT as a curatorship bond |
+| `withdrawCuratorBond` | 380 | reclaim, blocked while any vote is unsettled |
+| `fundChallengeBond` | 393 | lock GLT as challenging bond |
+| `withdrawChallengeBond` | 411 | reclaim only the *unlocked* portion |
+| `registerAttester` / `deactivateAttester` | 419 / 438 | committee management; deactivate reverts on unknown |
+| `submitAttestation` | 471 | lock stake, open window, returns `id` |
+| `signAttestation` | 501 | attester co-sign, accumulates weight |
+| `finalizeAttestation` | 521 | **the mint gate** — quorum + window + zero challenges |
+| `challengeAttestation` | 573 | red-team flag, accumulates, locks bond |
+| `castCuratorVote` | 593 | weighted panel ruling, bond-gated, refuses after settlement |
+| `tallyDispute` | 624 | applies the ruling once curator quorum is met |
+| `expireReview` | 648 | forces a stalled dispute after `REVIEW_WINDOW` |
+| `claimChallengeReward` | 856 | per-challenger pull payment |
+| `checkSecret` | 873 | stateless read-only hash check, records nothing |
+| `revealSecret` | 886 | post-window, challenger/curator only, verify-and-emit |
+| `evidenceVerdict` | 912 | the machine's tri-state opinion, never reverts |
+| `totalLiabilities` | 917 | every token the contract owes, never burnable |
+| `excessBalance` | 926 | held minus owed — the only burnable amount |
+| `recoverExcessStake` | 934 | burns unbacked balance only |
 
-Internal: `_settleCurators` (715) slashes dissenting curators and releases vote locks,
-`_penalise` (743) burns the submitter stake and signing attesters.
+Internal: `_resolve` (676) applies a ruling and owns both `panelOverride` rules,
+`_settleCurators` (762) slashes dissenting curators, releases vote locks and sets
+`panelSettled`, `_penalise` (791) burns the submitter stake and signing attesters.
 
 Setters: `setVerifier`, `setQuorumBps`, `setMinStake`, `setRewardAmount`, `setSlashBps`,
 `setAttesterBondAmount`, `setAttesterSlashBps`, `setChallengeBondAmount`, `setCuratorBondAmount`,
 `setCuratorSlashBps` (all `onlyOwner`; both bond setters reject zero).
 Getters: `challengeCount`, `signerWeight`, `attesterBond`, `challengeBond`, `curatorBond`,
-`lockedChallengeBond`, `curatorOpenVotes`, `curatorBallot`, `payoutShare`, `requiredQuorumWeight`,
-`getAttestation`, `attester`, `curator`.
+`lockedChallengeBond`, `curatorOpenVotes`, `curatorBallot`, `panelSettled`, `payoutShare`,
+`requiredQuorumWeight`, `getAttestation`, `attester`, `curator`.
+
+> **`panelSettled` is new (2026-10-05).** Read it alongside `panelOverride`: the first says the
+> panel has ruled and no further ballot is accepted, the second says the panel overruled a
+> non-CONFIRMED verdict. They are independent, and §5 records why only having the first is not
+> enough.
 
 > Bond defaults, all non-zero on purpose: `attesterBondAmount` 100e18, `challengeBondAmount`
 > 100e18, `curatorBondAmount` **1,000e18** (the panel is load-bearing for every REFUTED and
@@ -298,6 +338,109 @@ Getters: `challengeCount`, `signerWeight`, `attesterBond`, `challengeBond`, `cur
 ---
 
 ## 5. Hard-won lessons / gotchas
+
+### The vacuous-property lessons (2026-10-05)
+
+Three bugs found in one session by the invariant fixture, and the more useful finding was
+that **two of the properties I wrote to catch them were passing while testing nothing.** Both
+are recorded because the failure is silent and the suite is green throughout.
+
+- **A property the code under test already enforces cannot fail.** My first override property
+  was "an attestation finalized against a non-`CONFIRMED` verdict implies `panelOverride`".
+  But `finalizeAttestation` gates on exactly that condition, so no such finalization can ever
+  be recorded, so the implication is trivially true. I deleted the `panelOverride = true` line
+  from `_resolve` and the property stayed green. The falsifiable form is the converse:
+  "**`panelOverride` implies `rejectWeight > upholdWeight`**", which says the flag means what
+  it claims. That version caught two of the three bugs on its first run. **To check a property
+  is real, break the code it describes and confirm it goes red.**
+
+- **A precondition reading a different source of truth than the code under test is silently
+  false.** The verifier-outage property gated on `gate.shouldRevert()`. But the mock gate can
+  be in `perHash` mode *simultaneously*, where that flag is ignored and the revert comes from
+  the evidence hash instead — so the assertion was skipped on nearly every run. It now asks the
+  gate directly with a low-level `staticcall` and distinguishes the outcomes by
+  `returndatasize`, and it returns early when no verifier is configured (where GLT
+  short-circuits to `CONFIRMED` without calling anything).
+
+- **A precondition on a 1-in-16 hash bucket is vacuous in practice even when it is vacuous
+  only in theory.** The probe originally used `trackedAt(0)`, whose gate lookup reverts only
+  when its own content hash lands in the right bucket — so it was silent 15 times out of 16.
+  It now uses a dedicated `submitZeroHash` attestation whose `contentHash` is all zeroes,
+  which is in the reverting bucket by construction.
+
+- **Read the handler revert column.** `configureVerifier` had `vm.prank(GLT.owner())` at the
+  top of the function. `vm.prank` applies to the *next* call only, so it was consumed by
+  `gate.setPerHash(...)` and `setVerifier` then reverted `OwnableUnauthorizedAccount` — on
+  every single call, 440 out of 440. The suite reported `1 passed` throughout, because the
+  revert was inside the fuzzer's call accounting rather than a `try/catch`, so nothing
+  surfaced. The fixture's verifier had never once been changed. **A handler operation whose
+  revert count matches its call count is not passing.**
+
+### The referral-path bugs (2026-10-05)
+
+The invariant fixture deployed with `address(0)`, which makes every verdict `CONFIRMED`. That
+left the entire non-`CONFIRMED` half of the contract unreachable from the stateful suite: a
+panel ruling on an **unchallenged** attestation, and the `panelOverride` such a rejection
+sets. Adding a switchable gate exposed it immediately. All three were invisible to 115 green
+tests, including 10 green invariants.
+
+1. **Silence and ties recorded a human overruling that never happened.** `expireReview`
+   defaults a stalled panel to *reject* — by design, so a deadlocked panel can never slash an
+   innocent submitter. But `_resolve` set `panelOverride` on any rejection, including that
+   default and including an exact tie where the panel ruled on nothing. `panelOverride` is what
+   makes a `REFUTED`/`UNRESOLVED` attestation finalizable, so the sequence was: submit
+   refuted evidence, get quorum-signed, let the window close, let the review window lapse
+   without anyone voting, and the mint gate opens. Because the challenge window is absolute
+   and already shut, nothing could ever revisit it — permanent, silent approval. Now requires
+   `rejectWeight[id] > upholdWeight[id]`.
+
+2. **A panel could be re-opened after it had ruled.** The 2026-10-02 session made each
+   curator's *own* ballot permanent, which closed half of the re-ruling exploit. Nothing
+   stopped a *different* curator voting afterwards. On a **challenged** attestation the
+   clearing of the challenger list refused late ballots by itself (`NoChallengesToResolve`), so
+   this was unreachable there — but on the **referral** path the challenger list was already
+   empty, so `castCuratorVote` and a second `tallyDispute` were both accepted. Weights kept
+   moving after `_settleCurators` had released locks and slashed dissenters, so the record of
+   the ruling stopped describing the ruling that was applied. Fixed with `panelSettled[id]`.
+   Note the verdict could **not** be flipped: settling as a rejection requires
+   `rejectWeight >= 50%` of the panel, so disjoint late voters can never strictly outweigh it.
+   The damage was the frozen record, and `disputeUpheld` / the slashing leg being re-runnable
+   on a settled attestation. I initially wrote the test expecting a flip and had to correct it
+   — see the note in `test_NoCuratorMayVoteAfterThePanelHasRuled`.
+
+3. **An uphold left `panelOverride` behind.** A refused referral returns to `PENDING` and can
+   be challenged again, so it can be ruled on a second time and upheld. The flag then survived
+   on a `SLASHED` attestation, and an integrator reading `panelOverride` would treat a punished
+   submission as human-approved. `_resolve` now clears it on uphold.
+
+- **A property that forbids the feature it describes gets "fixed" by deleting the feature.**
+  My third attempt asserted an overridden attestation is never terminal, and failed on the
+  override's *intended* use — finalizing is exactly what it enables. Corrected to "a *slashed*
+  attestation never carries one", which is a real property and which bug 3 violates.
+
+### The deploy-script lessons (2026-10-05)
+
+Testing `Deploy.s.sol` against Anvil found two things that reading it could not.
+
+- **`proposers[0] = msg.sender` named the script contract, not the deployer.** Inside
+  `vm.startBroadcast`, `msg.sender` is not the broadcasting account. The timelock's only
+  proposer was an address nobody holds a key for, so the deployment was permanently
+  ungovernable while every constructor argument looked correct. Now `vm.addr(pk)`.
+- **`registerCurator` cannot be called by the deployer at all.** It is `onlyOwner` and the
+  owner is the timelock. An earlier version called it at the end of `run()` and reverted
+  `OwnableUnauthorizedAccount` against the live node. There is no inline path to it, so the
+  call is gone and the post-deploy sequence is documented instead: schedule through the
+  timelock, then each curator funds its own bond. **The panel is dead until they do**, and it
+  fails silently — every parameter looks healthy.
+- **Anvil needed `anvil_increaseTime`, not `anvil_mine`.** Mining blocks does not advance the
+  clock far enough for a two-day timelock; `execute` reverted `TimelockUnexpectedOperationState`.
+- **`forge script` looks for an entry point named `run`.** A `verify()` function is unreachable
+  from the CLI: "Function `run` not found in the ABI".
+- **`TimelockController` must be constructed with `admin = address(0)`.** With an admin set,
+  that key can re-point the proposer and executor sets at will, silently restoring single-key
+  control over everything the timelock governs, including `transferOwnership` of GLT.
+- **`vm.envUint` reverts on a missing key.** Any run command predating `TIMELOCK_DELAY` failed
+  on a variable the script no longer needed. `vm.envOr` with a stated default is correct here.
 
 ### The 47-green-tests trap (2026-09-30)
 
@@ -577,67 +720,56 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
 
 ## 6. Next actions, in order
 
-Items 1 (curator bond), 2 (size reclamation) and 3 (invariant handler) were all closed on
-2026-10-02 — see §4, §5 and §1. What remains:
+Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 5 (deploy
+script on Anvil), 8 (verifier in the fixture), plus the curator bond and size reclamation from
+2026-10-02. Item 4 (README) closed 2026-10-05. What remains:
 
-1. ☑ **Add a git remote.** Closed 2026-10-02. Remote is
-   `https://github.com/CosmicSlutAcademy/galactic-trust`, **public** — the user overrode the
-   private decision recorded earlier, after being told that `SESSION.md` itself is published and
-   is a disclosure surface. `gh` 2.46.0 is installed and authenticated over HTTPS, so no SSH
-   key was needed; `gh` is the git credential helper, so pushes need no further setup.
+1. ☐ **External audit before any mainnet deploy with real value.** This is now the *only*
+   engineering item left that gates shipping, and it is not optional. An unaudited contract
+   that mints a token people pay real money for is not a smaller version of this one, it is a
+   liability. Hand the auditor §5 as the list of what has already gone wrong here — it is an
+   unusually good map of where to look, and the 2026-10-05 referral bugs are exactly the class
+   an auditor would have charged most to find.
 
-   **The placeholder identity was real and was repo-local, not global.** `git config --global
-   user.email` was *absent*; the uppercased `GLOBAL.CYBER.INTELLIGENCE@EMAIL.COM` lived in
-   `galactic-trust/.git/config`, which takes precedence. Setting only the global would have
-   looked like a fix while leaving every commit on the old value — the same "accepted silently
-   and ignored" class of misconfiguration as top-level `invariant_runs`. **When an identity
-   looks wrong, check `git config user.email` from inside the repo, not `--global`.**
+   Specifically worth asking about: the `expireReview` default-reject path, whether
+   `panelOverride` + `panelSettled` can still be reached in a combination that deadlocks funds,
+   and whether the `ERC20Votes` checkpoint machinery interacts badly with `_burn` during
+   settlement.
+2. ☐ **Write a circom verifier** implementing `IVerifier`. The interface is tri-state and the
+   gate is live; there is still no real proof system behind it, so every verdict is `CONFIRMED`
+   in any real deployment. Model the unsolvable case too: a verifier that returns `UNRESOLVED`
+   when a proof is malformed, and one that reverts. **Blocked:** §5 records that WSL has no
+   working Node toolchain (`node` is absent, `npm` resolves to the Windows binary via `/mnt/c`).
+   Either install Node in WSL or drive circom/snarkjs from Windows. The invariant fixture now
+   exercises all three verdicts and the reverting case, so the gate plumbing is proven — only
+   the proving system is missing.
+3. ☐ **Testnet deploy**, then `Verify` against it. Anvil confirmed the mechanics and surfaced
+   two script bugs; a testnet will confirm the gas costs, which no local run has.
+4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,757 B** (was 2,006 B
+   on 2026-10-02; the three referral fixes and the deactivation guards cost 249 B). That is
+   roughly one and a half small features. If item 2 overruns, take `optimizer_runs` 20 → 1
+   (buys 47 B for ~1.6% gas, measured) or cut surface before raising the bar.
+5. ☐ **Legal wrapper** (Wyoming DAO LLC) if this is ever to hold real money. Nothing here is
+   legally binding; §2 records why that is not a Solidity problem at all.
 
-   All 9 commits were rewritten with `filter-branch --env-filter` onto
-   `⟠Δδ∞•⟐X∑⅃Δ <global.cyber.intelligence@email.com>`, which is the user's own stated identity
-   rather than a placeholder. Unpushed, so this was free — and it is the last moment it ever
-   will be. Reflogs expired and `refs/original` removed so the old casing does not survive in
-   the object store. Verified: 0 uppercase, 9 lowercase.
+### Not on the list, deliberately
 
-   Three commits were made from the previously-uncommitted work rather than one blob, split by
-   file: the curator bond, the optimizer retune, this log.
-
-2. ☐ **Reject `deactivateAttester` / `deactivateCurator` on unknown addresses** — they
-   silently succeed today, which hides typos in owner scripts. The invariant handler exercises
-   both, so a regression here will now surface as a weight-total mismatch.
-3. ☐ **Write a circom verifier** implementing `IVerifier`. The interface is tri-state and the
-   gate is live; there is still no real proof system behind it. Until one exists, every
-   verdict is `CONFIRMED` and the gate is untested in anger. Model the unsolvable case too:
-   a verifier that returns `UNRESOLVED` when a proof is malformed. Note this needs a
-   circom/snarkjs toolchain and §5 records that WSL has no working Node — probably blocked.
-4. ☐ **Replace the boilerplate `README.md`** (still the Foundry template). It must state
-   plainly that GLT asserts *staked testimony*, never truth. **Promoted by item 1:** the repo is
-   public, so the Foundry template is now the front page of the project and advertises itself as
-   a counterexample starter rather than as GLT. This is now the cheapest remaining item and the
-   only one a stranger will judge the work by. Say plainly that it is unaudited and not
-   deployable with real value yet, or the first reader will assume otherwise.
-5. ☐ **Test the deploy script against a local Anvil node**, then a testnet. Both bond amounts
-   now default non-zero, so the script no longer needs to set them — but it *will* need to fund
-   curator bonds before the panel can rule on anything.
-6. ☐ **External audit before any mainnet deploy with real value.** Non-negotiable. An
-   unaudited contract that mints a token people pay real money for is not a smaller version of
-   this one, it is a liability. Hand the auditor §5 as the list of what has already gone wrong
-   here; it is a useful map of where to look.
-7. ☐ **Re-check EIP-170 margin before landing each of the above.** 2,006 B is roughly two small
-   features. If one of items 2–5 overruns, take another `optimizer_runs` step down (20 → 1 buys
-   47 B for 1.6% gas) or cut surface before raising the bar.
-8. ☐ **Add a verifier to the invariant fixture.** It currently deploys with `address(0)`, so every
-   verdict is `CONFIRMED` and the panel is reached through challenges rather than referrals.
-   That leaves the REFUTED/UNRESOLVED → panel → `panelOverride` routes unexercised by the
-   stateful suite. Worth doing before the circom work, since it shares the fixture.
+- **Off-grid settlement.** §2 item 1. Physically impossible as specified; a store-and-forward
+  design is salvageable but is a different project.
+- **Pillar 2, access-gating / query fees.** Unbuilt. Adding it now would spend scarce EIP-170
+  margin before an audit has said what the 1,757 B should be spent on.
+- **Removing `secretRevealed` / `disputeUpheld` from the ABI.** Both have 0 external call sites
+  but are meaningful public record — `secretRevealed` is what a consumer reads to know a
+  pre-image was disclosed, and `disputeUpheld` is the ruling. Removing them to save bytes would
+   be cutting the audit trail, not dead code.
 
 ---
 
 ## 7. Reality check on priorities
 
 GLT is a real build with a defensible thesis, but it is **not** the thing with a clock on it.
-`~/bounty/SESSION.md` §3 has three unchecked bounty accounts, and identity verification
-(§3.2) takes **days to weeks**. That gates the whole income pipeline and gets no cheaper by
-waiting. GLT will be in exactly this state in a month either way.
+`~/bounty/SESSION.md` §3 has three unchecked bounty accounts, and identity verification (§3.2)
+takes **days to weeks**. That gates the whole income pipeline and gets no cheaper by waiting.
+GLT will be in exactly this state in a month either way.
 
 Sequence: do the accounts, then come back here.

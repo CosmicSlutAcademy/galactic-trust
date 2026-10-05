@@ -556,7 +556,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
 
     /// @dev Reads the verifier defensively. No verifier means CONFIRMED, so the honest
     /// "no opinion available" case does not block an otherwise valid attestation. A reverting
-/// verifier is treated as UNRESOLVED rather than propagating, because a broken proof system
+    /// verifier is treated as UNRESOLVED rather than propagating, because a broken proof system
     /// must not be able to halt finalization for every attestation at once.
     function _verdict(Attestation storage att) internal view returns (EvidenceVerdict) {
         address v = address(verifier);
@@ -663,7 +663,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         _resolve(id, att, false);
     }
 
-/// @dev Applies a ruling. `upheld` slashes the submitter and every signing attester;
+    /// @dev Applies a ruling. `upheld` slashes the submitter and every signing attester;
     /// otherwise challenge bonds are forfeited and the attestation returns to PENDING.
     ///
     /// An uphold *clears* any override a previous ruling left behind. The flag means "the panel
