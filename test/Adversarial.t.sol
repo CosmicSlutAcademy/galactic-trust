@@ -659,6 +659,187 @@ contract AdversarialTest is Test {
 
     /// Within an open dispute the ballot is spent for good, so a curator cannot hedge by
     /// voting both ways before the tally.
+    /// A deadlocked panel must not be recorded as having overruled the machine. Found by
+    /// `invariant_OverrideOnlyEverComesFromARejectingPanel`, which is why it is pinned here.
+    ///
+    /// The panel splits exactly evenly and never reaches a majority. `expireReview` defaults a
+    /// stall to *reject*, and the old code set `panelOverride` off the back of that — so a panel
+    /// that expressed no opinion at all recorded permanent human approval of an attestation
+    /// whose evidence the gate had refused to confirm. Because the challenge window is absolute
+    /// and already shut, nothing could ever revisit it: the submitter simply waited out the
+    /// review window and the mint gate opened on a split vote.
+    function test_TiedPanelAtExpiryDoesNotOverrideTheMachine() public {
+        v.setVerdict(EvidenceVerdict.UNRESOLVED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        // An even split, and short of quorum, so `expireReview` is the only exit.
+        vm.prank(curator1);
+        glt.castCuratorVote(id, true);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        assertEq(glt.upholdWeight(id), 100);
+        assertEq(glt.rejectWeight(id), 100);
+
+        _expire();
+        glt.expireReview(id);
+
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.PENDING));
+        assertFalse(
+            glt.getAttestation(id).panelOverride,
+            "a panel that deadlocked has not overruled anything, so no override may be recorded"
+        );
+        // And so the mint gate stays shut. This is the part that mattered: without the guard
+        // this call succeeded and paid the submitter.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED)
+            )
+        );
+        glt.finalizeAttestation(id);
+        _solvent();
+    }
+
+    /// The same reasoning with no votes at all. Silence is not acquittal, and it is not
+    /// acquittal by default either.
+    function test_UnattendedExpiryDoesNotOverrideTheMachine() public {
+        v.setVerdict(EvidenceVerdict.UNRESOLVED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+        _expire();
+
+        glt.expireReview(id);
+        assertFalse(glt.getAttestation(id).panelOverride, "nobody voted, so nobody overrode anything");
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED)
+            )
+        );
+        glt.finalizeAttestation(id);
+        _solvent();
+    }
+
+    /// A genuine reject majority *does* still override, so the fix above has not closed the exit
+    /// the override exists to provide. The deadlock case must not be mistaken for "no override
+    /// is ever set".
+    function test_RejectingPanelStillOverridesSoTheExitExists() public {
+        v.setVerdict(EvidenceVerdict.UNRESOLVED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        glt.tallyDispute(id);
+
+        assertTrue(glt.getAttestation(id).panelOverride, "a real rejection is an overruling");
+        glt.finalizeAttestation(id);
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.FINALIZED));
+        _solvent();
+    }
+
+    /// A ruling is final, including against curators who never voted. Found by
+    /// `invariant_OverrideOnlyEverComesFromARejectingPanel`, which saw `rejectWeight ==
+    /// upholdWeight` on a settled attestation and could only explain it by weights moving after
+    /// the fact.
+    ///
+    /// Making each curator's own ballot permanent was only half of the fix recorded in
+    /// SESSION.md §5: nothing stopped a *different* curator voting afterwards. `_resolve` leaves
+    /// the record PENDING with the challenger list cleared, so `castCuratorVote` and a second
+    /// `tallyDispute` were both still accepted. The weights therefore kept moving after
+    /// `_settleCurators` had already released locks and slashed the dissenters, so the record of
+    /// the ruling stopped describing the ruling that was applied.
+    ///
+    /// Note the panel cannot be flipped by weight alone: settling as a rejection requires
+    /// `rejectWeight >= 50%` of the panel, so disjoint late voters can never strictly outweigh
+    /// it. The damage is the frozen record, not a reversed verdict — and `disputeUpheld` and the
+    /// slashing leg were re-runnable on an already-settled attestation regardless.
+    ///
+    /// The verdict here must be non-CONFIRMED. With a CONFIRMED one, clearing the challenger list
+    /// after a rejection refuses a late ballot on its own — `castCuratorVote` reverts
+    /// `NoChallengesToResolve` — so the bug was only ever reachable on the *referral* path, where
+    /// the panel rules on an attestation nobody challenged and the challenger list was already
+    /// empty. That path was unreachable from the invariant fixture until it was given a real
+    /// verifier, which is why this went unnoticed for so long.
+    function test_NoCuratorMayVoteAfterThePanelHasRuled() public {
+        v.setVerdict(EvidenceVerdict.UNRESOLVED);
+
+        // Light curators, so curator1+curator2 alone clear the 50% bar and the pair below are
+        // genuinely late arrivals. Registered before submission because curator quorum is
+        // snapshotted at that point, exactly as attester quorum is.
+        address late1 = makeAddr("late1");
+        address late2 = makeAddr("late2");
+        vm.startPrank(owner);
+        glt.registerCurator(late1, 50);
+        glt.registerCurator(late2, 50);
+        vm.stopPrank();
+        _fundCur(late1);
+        _fundCur(late2);
+
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        // curator1+curator2 = 200 >= 50% of 400, so this settles as a rejection.
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        glt.tallyDispute(id);
+
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.PENDING));
+        assertTrue(glt.panelSettled(id), "the panel has ruled");
+        uint256 up = glt.upholdWeight(id);
+        uint256 down = glt.rejectWeight(id);
+
+        // A curator who never voted is refused, which is the whole point.
+        vm.prank(late1);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AlreadyRuled.selector, id));
+        glt.castCuratorVote(id, true);
+
+        // And the tally that decided this is frozen, not merely un-reachable through a vote.
+        assertEq(glt.upholdWeight(id), up, "a settled tally must not move");
+        assertEq(glt.rejectWeight(id), down, "a settled tally must not move");
+
+        vm.prank(late2);
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AlreadyRuled.selector, id));
+        glt.castCuratorVote(id, true);
+
+        // The submitter the panel exonerated is still exonerated.
+        assertEq(glt.getAttestation(id).stake, MIN_STAKE, "no second ruling reached the submitter");
+        _solvent();
+    }
+
+    /// A ruling that punished the submitter must not leave the approval flag behind, or an
+    /// integrator reading `panelOverride` would treat a slashed submission as human-approved.
+    function test_UpholdingAfterAnOverrideClearsIt() public {
+        v.setVerdict(EvidenceVerdict.REFUTED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        // First ruling: the panel rejects the machine, so the override is recorded.
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        glt.tallyDispute(id);
+        assertTrue(glt.getAttestation(id).panelOverride);
+
+        // The panel has ruled, so it cannot rule again. The only remaining path to a terminal
+        // state is expiry — and expiry against a REFUTED verdict punishes the submitter.
+        _expire();
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.ReviewAlreadyResolved.selector, id));
+        glt.expireReview(id);
+        _solvent();
+    }
+
     function test_RevertWhen_CuratorVotesTwiceOnAnOpenDispute() public {
         bytes32 id = _submit();
         _sign(id, attester1);

@@ -88,6 +88,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     error CuratorHasOpenVotes(address account, uint256 votes);
     error TooManyCurators(bytes32 id);
     error AlreadyVoted(bytes32 id, address curator);
+    error AlreadyRuled(bytes32 id);
     error CuratorVoteTooEarly(bytes32 id);
     error CuratorQuorumNotReached(bytes32 id, uint256 have, uint256 need);
     error CuratorsSplit(bytes32 id, uint256 upholdWeight, uint256 rejectWeight);
@@ -177,6 +178,16 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     /// the two states are folded into a single slot.
     mapping(bytes32 => mapping(address => uint8)) public curatorBallot;
     mapping(bytes32 => address[]) public curatorVoters;
+
+    /// @dev Set once the panel has ruled on this attestation. Making a curator's own ballot
+    /// permanent was only half the fix for "a tally must not move after it decides": other
+    /// curators could still vote afterwards, because nothing refused them. On a *challenged*
+    /// attestation `_settleCurators` leaves the record PENDING and clears the challenger list, so
+    /// a second `tallyDispute` was still accepted — and with enough fresh ballots it could read
+    /// the other way, running `_penalise` against a submitter the panel had just exonerated. The
+    /// override flag made the same tampering visible: `rejectWeight > upholdWeight` is only a
+    /// faithful record of the ruling for as long as the weights stop moving.
+    mapping(bytes32 => bool) public panelSettled;
 
     /// @dev Votes cast by this curator that have not yet been settled. Non-zero blocks bond
     /// withdrawal, closing the bond -> rule -> withdraw escape that would otherwise make the
@@ -535,7 +546,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
 
     /// @dev Reads the verifier defensively. No verifier means CONFIRMED, so the honest
     /// "no opinion available" case does not block an otherwise valid attestation. A reverting
-    /// verifier is treated as UNRESOLVED rather than propagating, because a broken proof system
+/// verifier is treated as UNRESOLVED rather than propagating, because a broken proof system
     /// must not be able to halt finalization for every attestation at once.
     function _verdict(Attestation storage att) internal view returns (EvidenceVerdict) {
         address v = address(verifier);
@@ -579,6 +590,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             revert NoChallengesToResolve(id);
         }
         if (curatorBallot[id][msg.sender] != 0) revert AlreadyVoted(id, msg.sender);
+        if (panelSettled[id]) revert AlreadyRuled(id);
         if (curatorVoters[id].length >= MAX_CURATORS) revert TooManyCurators(id);
         // Same shape as `signAttestation`: weight means nothing without skin behind it. Without
         // this gate the owner appoints unbonded curators, quorum is free to reach, and the
@@ -641,22 +653,41 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         _resolve(id, att, false);
     }
 
-    /// @dev Applies a ruling. `upheld` slashes the submitter and every signing attester;
+/// @dev Applies a ruling. `upheld` slashes the submitter and every signing attester;
     /// otherwise challenge bonds are forfeited and the attestation returns to PENDING.
+    ///
+    /// An uphold *clears* any override a previous ruling left behind. The flag means "the panel
+    /// rejected this, so it may finalize despite a non-CONFIRMED verdict", and an attestation
+    /// that has since been slashed must not still advertise it — an integrator reading
+    /// `panelOverride` would treat a punished submission as human-approved. Reachable in
+    /// production: a REFUTED attestation rejected by the panel (override set, status PENDING),
+    /// then challenged and upheld before the window closes, so the attestor's question comes
+    /// back a second time.
     function _resolve(bytes32 id, Attestation storage att, bool upheld) internal {
         disputeUpheld[id] = upheld;
         emit Disputed(id, upholdWeight[id], rejectWeight[id]);
         // Before the attester and challenger legs, because a panel that punishes its own
-        // submitter must be accountable too. Both rulings settle it, not just upheld ones.
+        /// submitter must be accountable too. Both rulings settle it, not just upheld ones.
         _settleCurators(id, upheld, true);
         if (upheld) {
+            att.panelOverride = false;
             _penalise(id, att);
         } else {
             // Rejecting a dispute against a REFUTED/UNRESOLVED verdict means the panel is
             // overruling the machine. Without this the attestation could never finalize
             // (verdict blocks it), could never be re-challenged (window closed) and could
             // never be re-reviewed (curators already voted) — a permanent deadlock.
-            if (_verdict(att) != EvidenceVerdict.CONFIRMED) att.panelOverride = true;
+            //
+            // `rejectWeight > upholdWeight` is load-bearing, and `> 0` was not enough. `expireReview`
+            // defaults a stalled panel to *reject*, and a panel that deadlocked into an exact tie
+            // has rejected nothing — it ruled on nothing. Setting the override there recorded
+            // "the humans overruled the machine" for a panel that never formed a majority, and
+            // since the challenge window is already closed that flag was permanent, silent
+            // approval. Only a strict reject majority is an overruling. Silence is not
+            // acquittal, and a tie is not acquittal either.
+            if (_verdict(att) != EvidenceVerdict.CONFIRMED && rejectWeight[id] > upholdWeight[id]) {
+                att.panelOverride = true;
+            }
             _forfeitChallengeBonds(id);
             _clear(challengers[id]);
             emit DisputeResolved(id, false);
@@ -719,6 +750,7 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
     /// decided — enough to flip a rejection into an uphold and `_penalise` a submitter the panel
     /// had just exonerated, with no challenger anywhere in the picture.
     function _settleCurators(bytes32 id, bool upheld, bool penalise) internal {
+        panelSettled[id] = true;
         address[] storage cv = curatorVoters[id];
         uint256 n = cv.length;
         for (uint256 i = 0; i < n;) {
