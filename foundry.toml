@@ -2,6 +2,10 @@
 src = "src"
 out = "out"
 libs = ["lib"]
+# test/CircomVerifier.t.sol reads the Groth16 fixtures with vm.readFile. Foundry resolves
+# readFile against the project root, not the test directory, so the path is relative to
+# here. Without this, setUp fails with "the path ... is not allowed to be accessed".
+fs_permissions = [{ access = "read", path = "./test/fixtures"}]
 
 # The optimizer is off by default, which left the runtime bytecode at ~38 KB against the
 # 24,576 B EIP-170 limit, so the contract could not have been deployed at all. Verified with

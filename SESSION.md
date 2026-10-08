@@ -1,17 +1,23 @@
 # SESSION STATE — Galactic-Trust (GLT) / GCIA epistemic ledger
 > Re-read this file first every time you resume. This is the single source of truth for GLT.
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-07
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
-**Location:** `~/galactic-trust` (939 src / 3029 test lines Solidity, 5,153 total)
-**Status:** 125/125 tests green on both profiles (default ~5 s; `deep` = 5 fuzz suites at
-2000 runs + 10 invariants at 128,000 calls each = 145 s), deploy script exercised against
-Anvil, NOT deployed to a public network, NOT audited.
+**Location:** `~/galactic-trust` (1,052 src / 3,638 test lines Solidity + one circom circuit)
+**Status:** 150/150 tests green on both profiles (default ~6 s; `deep` = 5 fuzz suites at
+2000 runs + 10 invariants at 128,000 calls each = 160 s), deploy script exercised against
+Anvil, a real Groth16 verifier built and tested against genuine proofs, NOT deployed to a
+public network, NOT audited.
 
 **Read this first if you are resuming.** The referral path was never tested until
 2026-10-05, and finding out why produced three fund-loss bugs plus two properties that
 passed while testing nothing at all. Both lessons are in §5; the short version is that a
 green property is not evidence of anything until you have watched it fail.
+
+**Second thing to read.** §6 item 2 (the circom verifier) was marked **blocked** on a missing
+toolchain. It is no longer blocked, and it is now built. What it took is in §5 "The circom
+toolchain lessons" — including one bug that made every valid proof read as rejected while
+`groth16.verify` in JavaScript happily accepted the same proof.
 
 ---
 
@@ -19,21 +25,24 @@ green property is not evidence of anything until you have watched it fail.
 
 | Item | State |
 |---|---|
-| Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **needs PATH export, see §3** |
+| Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **use the absolute path in scripts, see §3** |
 | `GalacticTrust.sol` | ✅ compiles, quorum attestation + challenge window + slashing |
-| Test suite | ✅ 125/125 passing (83 unit + 27 adversarial + 5 fuzz + 10 invariant) |
+| Test suite | ✅ 150/150 passing (83 unit + 27 adversarial + 5 fuzz + 10 invariant + 25 verifier) |
 | Tri-state evidence gate | ✅ `CONFIRMED`/`REFUTED`/`UNRESOLVED`, enforced at finalize |
 | Verifier outage failsafe | ✅ a reverting verifier → `UNRESOLVED`, never a protocol halt |
 | Curator quorum snapshot | ✅ snapshotted at submission, owner cannot move it mid-dispute |
 | Dispute tie-break | ✅ `expireReview` after `REVIEW_WINDOW` (7 days), rejects by default |
 | Commit-reveal gating | ✅ post-window, challenger-or-curator only, verify-and-emit |
 | Fuzz suite | ✅ conservation + multi-challenger payout + expiry terminality + curator slash |
-| **Invariant handler** | ✅ **7 stateful properties, 15 handler ops — §6.3 closed, found 1 bug** |
+| **Invariant handler** | ✅ **10 stateful invariants, 17 handler ops — §6.3 closed, found 1 bug** |
 | **Curator stake behind appointment** | ✅ **bonded, locked while voting, loser's bond slashed — §6.1 closed** |
 | Escrow solvency invariant | ✅ `totalLiabilities()` accounted on every movement |
 | Owner burn limited to unbacked balance | ✅ `recoverExcessStake` cannot touch live escrow |
 | Challenge bond locked while challenge open | ✅ `lockedChallengeBond` |
 | Contract size within EIP-170 | ✅ 22,819 B — 1,757 B margin |
+| **Real ZK verifier** | ✅ **BUILT — `circuit/evidence.circom` + `src/CircomVerifier.sol`, Groth16, 25 tests on real proofs. NOT wired into any deployment** |
+| **Verifier trust boundary** | ✅ **device registry; `deviceKeyHash` bound to the signing key in-circuit — see §5** |
+| **Evidence-hash field check** | ⚠️ **`_inField` refuses out-of-field hashes. ~81% of random bytes32 are out of field — see §5** |
 | **Referral path** (`REFUTED`/`UNRESOLVED` → panel → `panelOverride`) | ✅ **now exercised — 3 bugs found and fixed, see §5** |
 | **Panel cannot be re-opened after ruling** | ✅ `panelSettled` — a ruling is final |
 | **`panelOverride` requires a strict reject majority** | ✅ silence and ties no longer grant approval |
@@ -46,9 +55,8 @@ green property is not evidence of anything until you have watched it fail.
 | Weighted curator panel | ✅ built — `onlyOwner` ruling replaced |
 | Bounded settlement loops | ✅ `MAX_SIGNERS`/`MAX_CHALLENGERS`/`MAX_CURATORS` caps + pull payments |
 | Access-gating / query fees (pillar 2) | ❌ not built — separate contract |
-| Real ZK verifier | ❌ `IVerifier` is wired and enforced, but no circom verifier exists yet |
 | Audit | ❌ none |
-| Git remote | ❌ local-only history, single disk — see §6 |
+| Git remote | ✅ `origin` → `CosmicSlutAcademy/galactic-trust`, **3 commits unpushed** |
 | Mainnet/testnet deploy | ❌ none |
 
 ---
@@ -113,10 +121,14 @@ slashable, not eliminated. This is the honest version of the design.
 
 ```bash
 cd ~/galactic-trust
-forge test                        # 125/125, ~5 s    (default profile)
-FOUNDRY_PROFILE=deep forge test   # 125/125, ~145 s  (full sweep, pre-ship)
-forge build --sizes              # MUST stay under 24,576 B EIP-170
+/home/alexa/.foundry/bin/forge test                        # 125/125, ~6 s  (default profile)
+FOUNDRY_PROFILE=deep /home/alexa/.foundry/bin/forge test   # 125/125, ~145 s (full sweep, pre-ship)
+/home/alexa/.foundry/bin/forge build --sizes                # MUST stay under 24,576 B EIP-170
 ```
+
+**Use the absolute path, not bare `forge`.** §5 records why, and it was re-verified
+2026-10-06: `env -i /bin/sh script.sh` resolves `/usr/bin/forge`, which is ZOE. Bare `forge`
+is safe interactively and from a login shell; it is *not* safe inside a script.
 
 **Two profiles, and the split is deliberate.** The default runs invariants at 32×250 = 8,000
 calls per property so `forge test` stays usable on every edit; `deep` runs 256×500 = 128,000
@@ -133,8 +145,11 @@ here that a green run actively hides from you.
 silently and ignored.** They must be in an `[invariant]` table as `runs` and `depth`. Verified
 with `forge config | sed -n '/\[invariant\]/,/^$/p'`. Same trap for fuzz: `[fuzz] runs`.
 
-**PATH is already configured** — no manual export needed. It is set in both `~/.bashrc`
-(interactive) and `~/.profile` (login), verified working from both.
+**PATH is configured for interactive and login shells only** — `~/.bashrc:124` and
+`~/.profile:32-33`. Verified 2026-10-06: `bash -lc 'command -v forge'` → the real binary, but
+`env -i /bin/sh script.sh` → `/usr/bin/forge` (ZOE). **This is why the commands above use
+the absolute path, and why "PATH is already configured, no export needed" was wrong as
+written** — it was true for the shells it was tested in and false for scripts.
 
 ⚠️ **`/usr/bin/forge` is NOT Foundry.** It is *ZOE*, an unrelated estimation tool from 2013
 (`ZOE library version 2013-02-16`), and it shadows the real binary. If `forge --version` prints
@@ -284,7 +299,7 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
 - Owner is expected to be a `TimelockController` with `admin = address(0)`.
 - `Ownable2Step` — `transferOwnership` alone leaves one key in control until accepted.
 
-### Contract surface (`src/GalacticTrust.sol`, ~890 lines)
+### Contract surface (`src/GalacticTrust.sol`, 939 lines)
 
 | Function | Line | Role |
 |---|---|---|
@@ -375,6 +390,79 @@ are recorded because the failure is silent and the suite is green throughout.
   revert was inside the fuzzer's call accounting rather than a `try/catch`, so nothing
   surfaced. The fixture's verifier had never once been changed. **A handler operation whose
   revert count matches its call count is not passing.**
+
+### The circom toolchain lessons (2026-10-07)
+
+§6 item 2 was blocked on `circom` / `snarkjs` being absent. It is unblocked and built. Five
+things cost real time, and four of them fail silently.
+
+- **`snarkjs`'s `pi_b` is NOT the Solidity verifier's layout.** This was the big one. Copying
+  `proof.pi_a / pi_b / pi_c` into the `verifyProof(uint[2], uint[2][2], uint[2], uint[4])`
+  arguments produces a proof that `groth16.verify` in JavaScript **accepts** and the EVM
+  **rejects**, with the only symptom being `proof rejected` on every single submission. Each G2
+  row needs its two coordinates swapped, and `snarkjs.groth16.exportSolidityCallData` is what
+  performs that swap. `genproofs.js` now takes the encoding from there and *asserts* the flip
+  happened. If you hand-transpose this, you will lose a day to a message that says nothing about
+  the real cause.
+- **`BigInt("1111...1111")` parses as DECIMAL.** `contentHash` is a hex string, so the witness
+  committed to an entirely different number than the one the contract passed in. On-chain this
+  looks identical to a broken proof: `proof rejected`. Found by printing the fixture's own
+  `publicSignals[0]` and noticing it did not equal `contentHash`. **Hex in, `BigInt("0x" + s)`
+  out** — and when a fixture and the thing it is supposed to describe disagree, print both.
+- **The generated verifier reads its arguments with `calldataload`.** So the call must be
+  genuinely *external*. Solidity refuses a direct internal call (memory → calldata), and the
+  obvious wrapper that *does* compile — `verifyProofWith(...) { return verifyProof(...); }` —
+  passes a memory pointer where the assembly expects a calldata offset and silently rejects
+  every proof. Do not "simplify" `this.verifyProof(...)` into a wrapper.
+- **circomlibjs returns `Uint8Array`/`BigInt` in montgomery form.** `F.toObject()` unwraps
+  coordinates, and Poseidon's own return value must be unwrapped too — interpolating it
+  directly yields `"47,48,34,..."`, which the witness calculator rejects with
+  `Cannot convert ... to a BigInt`. Note `prv2pub` returns Montgomery `Uint8Array`, while
+  `verifyPoseidon` wants that *same* form: do not mix the two representations.
+- **circom 2 removed global `var`.** Constants must live inside the template, and array
+  literals need `IsEqual` components for selectors — `(tier == i)` yields a boolean and cannot be
+  multiplied. Also `LessThan(n)`/`LessEqThan(n)` need both operands in range, so the witness has
+  to be bounded *before* the comparison, not after.
+- **`snarkjs powersoftau beacon` needs a `numIterationsExp`.** Omitting it gives
+  `Invalid number of parameters`. And `groth16 setup` requires `powersoftau prepare phase2`
+  first; skipping it leaves a zero-byte `circuit_0000.zkey` and the misleading
+  `Powers of tau is not prepared`.
+
+### The verifier's trust boundary (2026-10-07)
+
+Two design points that are easy to get wrong and were checked by breaking them (§5's
+vacuous-property rule applied to a circuit rather than a contract).
+
+- **The circuit proves *a* signature, not *whose*.** Without a device registry, anyone can
+  generate a valid `REFUTED` for anyone else's `evidenceHash` and permanently block their
+  finalization. `CircomVerifier.approvedDevice` is therefore the actual trust boundary, and
+  `submitProof` is permissionless — gating submission on the owner would hand one key the power
+  to suppress a `REFUTED`, which is the same single-point-of-failure shape as letting the owner
+  settle disputes directly.
+- **`deviceKeyHash` must be bound to the signing key inside the circuit**
+  (`deviceKeyHash === Poseidon(Ax, Ay)`). The public key is a *private* witness input, so
+  without that constraint a prover signs with a key they invented and then *asserts* an approved
+  hash. The pairing would pass, the registry check would pass, and the gate would be closed at
+  will. Confirmed by removing the constraint and regenerating: the unapproved device's proof
+  then verifies.
+- **`REFUTED` is a proof, not an absence.** `verdict === inEnvelope.out` pins the verdict to the
+  envelope check on the private witness, so a prover cannot relabel an in-envelope reading as
+  `REFUTED`. This one cannot be tested from Solidity at all — there, the verdict is simply part
+  of the proof's public signals, so the pairing fails for a different reason. Verified by
+  removing the constraint, rebuilding, and asking the prover directly: the witness is accepted
+  with the constraint gone and rejected with it in place. **Some properties of a ZK system are
+  only observable from the prover side.**
+- **Out-of-field evidence hashes are refused, not reduced.** `hash` and `hash - SNARK_FIELD`
+  encode to the same field element, so reducing would let one attestation read another's
+  verdict. But the BN254 field is 254 bits and a `bytes32` is 256, so **~81% of uniformly random
+  bytes32 values are out of field** — `keccak256` output included. A submitter that picks a hash
+  without checking finds every submission reverting with `NotInField`. Nothing is lost (the
+  verdict stays `UNRESOLVED`, which routes to the curator panel rather than minting), but a claim
+  meant to be machine-checkable silently never becomes so. `isProvable(bytes32)` exists for this,
+  and the 81% figure is asserted in a test rather than trusted.
+- **The circuit cannot express `SNARK_FIELD` at all** (circom 2 has no global `var` and a
+  254-bit constant is not worth bitslicing), so the check lives in the contract. That is not a
+  workaround, it is the right place: the contract is the only place a `bytes32` enters.
 
 ### The referral-path bugs (2026-10-05)
 
@@ -609,8 +697,11 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
   finalization, not `+ REWARD`. Also `totalSupply` drops by the burned stake on an upheld
   dispute — it is not a constant.
 
-- WSL has no Linux Node; `node` is absent and `npm` resolves to the Windows binary via `/mnt/c`.
-  Irrelevant for Solidity, but do not assume a Node toolchain works in WSL.
+- WSL had no Linux Node when this was first recorded; `node` was absent and `npm` resolved to
+  the Windows binary via `/mnt/c`. **Re-checked 2026-10-06: `/usr/bin/node` is now present at
+  v22.22.1**, but `npm` still resolves to `/mnt/c/Program Files/nodejs/npm` and `circom` /
+  `snarkjs` are still absent. So a Node runtime exists; a circom toolchain does not.
+  Irrelevant for Solidity, but do not assume the toolchain is complete — check each binary.
 
 - **`payoutPool` cannot represent N independent claims.** It stored the per-challenger
   `each`, and `claimChallengeReward` zeroed it, so with 2 challengers the first to call took
@@ -720,9 +811,9 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
 
 ## 6. Next actions, in order
 
-Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 5 (deploy
-script on Anvil), 8 (verifier in the fixture), plus the curator bond and size reclamation from
-2026-10-02. Item 4 (README) closed 2026-10-05. What remains:
+Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4 (README),
+5 (deploy script on Anvil), 8 (verifier in the fixture), **2 (circom verifier — closed
+2026-10-07)**, plus the curator bond and size reclamation from 2026-10-02. What remains:
 
 1. ☐ **External audit before any mainnet deploy with real value.** This is now the *only*
    engineering item left that gates shipping, and it is not optional. An unaudited contract
@@ -735,23 +826,32 @@ script on Anvil), 8 (verifier in the fixture), plus the curator bond and size re
    `panelOverride` + `panelSettled` can still be reached in a combination that deadlocks funds,
    and whether the `ERC20Votes` checkpoint machinery interacts badly with `_burn` during
    settlement.
-2. ☐ **Write a circom verifier** implementing `IVerifier`. The interface is tri-state and the
-   gate is live; there is still no real proof system behind it, so every verdict is `CONFIRMED`
-   in any real deployment. Model the unsolvable case too: a verifier that returns `UNRESOLVED`
-   when a proof is malformed, and one that reverts. **Blocked:** §5 records that WSL has no
-   working Node toolchain (`node` is absent, `npm` resolves to the Windows binary via `/mnt/c`).
-   Either install Node in WSL or drive circom/snarkjs from Windows. The invariant fixture now
-   exercises all three verdicts and the reverting case, so the gate plumbing is proven — only
-   the proving system is missing.
+2. ✅ **Circom verifier — CLOSED 2026-10-07.** `circuit/evidence.circom` (7,513 constraints at
+   the first build; now 4,861 with the Poseidon signature scheme) + `src/CircomVerifier.sol`,
+   exercised by 25 tests against genuine Groth16 proofs. The toolchain was unblocked by
+   installing `circom` 2.1.9 to `~/.local/bin` and `snarkjs` + `circomlibjs` to
+   `~/.localtools/snarkjs` (npm installed via `corepack npm`, since `npm` on PATH is the
+   Windows binary). What it proves and — more importantly — what it does not: §5 "The verifier's
+   trust boundary". **It is not set on any deployment**, so `verifier` remains `address(0)` and
+   every verdict is still `CONFIRMED` in practice; wiring it up is a deployment decision, not
+   an engineering one, and it belongs in the audit conversation.
 3. ☐ **Testnet deploy**, then `Verify` against it. Anvil confirmed the mechanics and surfaced
    two script bugs; a testnet will confirm the gas costs, which no local run has.
-4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,757 B** (was 2,006 B
-   on 2026-10-02; the three referral fixes and the deactivation guards cost 249 B). That is
-   roughly one and a half small features. If item 2 overruns, take `optimizer_runs` 20 → 1
-   (buys 47 B for ~1.6% gas, measured) or cut surface before raising the bar.
-5. ☐ **Legal wrapper** (Wyoming DAO LLC) if this is ever to hold real money. Nothing here is
+4. ☐ **Re-check EIP-170 margin before landing each of the above.** Still **1,757 B** — the
+   verifier is a separate 3,573 B contract and cost the token nothing. Unchanged from
+   2026-10-02. If a future change overruns, take `optimizer_runs` 20 → 1 (buys 47 B for ~1.6%
+   gas, measured) or cut surface before raising the bar.
+5. ☐ **Decide whether the ~81% out-of-field hash rate is acceptable** (new, 2026-10-07). Not a
+   bug — refusing out-of-field hashes is required for soundness — but it means most submitters
+   will never get a machine verdict unless they pick an in-field `contentHash`. Options, in
+   order of preference: require submitters to pass `isProvable(hash)` before submitting;
+   constrain `contentHash` at submission time in GLT (costs EIP-170 bytes in the token, which
+   is currently scarcer than they seem); or accept that only device-attested evidence is ever
+   machine-checked, which is arguably the honest scope anyway. **Do not fix this by reducing
+   the hash modulo the field** — that reintroduces the cross-attestation collision the check
+   exists to prevent.
+6. ☐ **Legal wrapper** (Wyoming DAO LLC) if this is ever to hold real money. Nothing here is
    legally binding; §2 records why that is not a Solidity problem at all.
-
 ### Not on the list, deliberately
 
 - **Off-grid settlement.** §2 item 1. Physically impossible as specified; a store-and-forward

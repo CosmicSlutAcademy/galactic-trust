@@ -3,6 +3,14 @@ out/
 cache/
 broadcast/
 
+# circom intermediates. circuit_final.zkey, verification_key.json and Verifier.sol are
+# deliberately COMMITTED: they are the proving system, and regenerating the keys
+# invalidates every proof already submitted on chain.
+circuit/evidence_js/
+circuit/evidence.r1cs
+circuit/evidence.sym
+*.ptau
+
 # Dependencies — restore with the commands in SESSION.md §3
 lib/
 
@@ -14,3 +22,4 @@ lib/
 # Editor / OS
 .DS_Store
 *.swp
+.aider*

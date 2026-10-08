@@ -36,11 +36,14 @@ Two consequences worth stating plainly:
 **Unaudited. Not deployed. Not ready to hold value.**
 
 - No external audit has been done. This is the single biggest gap.
-- There is no real verifier. `IVerifier` is wired in, enforced at finalization, and returns
-  one of three verdicts — but nothing implements it yet, so every verdict is `CONFIRMED` and
-  the gate has never been exercised against a real proof system.
+- There is now a real verifier. `circuit/evidence.circom` + `src/CircomVerifier.sol` implement
+  `IVerifier` against a Groth16 proof system, exercised by 25 tests running real proofs. It is
+  **not** set on any deployment — `verifier` is still `address(0)` unless you pass `VERIFIER`
+  to the deploy script — so in a default deployment every verdict is still `CONFIRMED`.
+- What a `CONFIRMED` means is narrow: an *approved device key* signed a reading that fits its
+  declared tier's numeric envelope. It does not mean the reading is true. See below.
 - The repository is at `~/galactic-trust`, built with Foundry 1.5.1, Solidity 0.8.33,
-  OpenZeppelin 5.7.0. 125 tests pass, including 10 stateful invariants over a 17-operation
+  OpenZeppelin 5.7.0. 150 tests pass, including 10 stateful invariants over a 17-operation
   handler.
 
 The three pillars of the original design could not be built as written, and the reasons are
@@ -51,9 +54,12 @@ worth recording so they are not relitigated:
    does not exist. Store-and-forward gives *eventual* settlement under partition, which is
    salvageable; continuous operation is not.
 2. **ZK proves computation, not truth.** A proof can show a report is well-formed. It cannot
-   show an institution did what the report claims. What is built instead is commit-reveal
-   (`contentHash` + `secret`, revealed during disputes): confidentiality without a proof
-   system. `IVerifier` is the plug-in point for a real verifier later.
+   show an institution did what the report claims. The built verifier proves exactly that
+   much and no more: a registered device signed a sensor reading, and that reading is inside
+   the numeric envelope its declared tier allows. A device that lies *within* its envelope
+   gets a valid `CONFIRMED`. Commit-reveal (`contentHash` + `secret`, revealed during
+   disputes) still carries the confidentiality, and the bonded curator panel still carries the
+   judgement.
 3. **Smart contracts are not legally binding.** No jurisdiction enforces Solidity. Real
    enforcement needs a legal wrapper and human arbitration, neither of which exists here.
 
@@ -92,6 +98,45 @@ The contract calls the verifier inside a `try/catch` and maps a **revert** to `U
 a broken proof system can never halt the protocol. Fail-closed was rejected as the base case
 because it makes `setVerifier` a single point of total failure with no override; this shape
 gets the teeth without the liveness dependency.
+
+### The verifier: what a verdict actually certifies
+
+`circuit/evidence.circom` proves one thing — that a holder of an **approved device signing
+key** signed a specific sensor reading, and that the reading sits inside the numeric envelope
+its declared tier allows (tier 0 / `UNVERIFIED` accepts 0–100; tier 3 / `R2` accepts 0–10000;
+tier 6 / `R5` accepts anything under 2³²). `src/CircomVerifier.sol` checks the Groth16 pairing,
+records the outcome, and answers `IVerifier`.
+
+| State | Meaning |
+|---|---|
+| `CONFIRMED` | an approved device signed a reading that fits its tier's rules |
+| `REFUTED` | an approved device signed a reading that breaks them |
+| `UNRESOLVED` | no approved device has proved anything about this evidence |
+
+Three properties are worth stating plainly, because they are easy to over-claim:
+
+- **This is not a truth claim.** A device that reports a plausible-but-false number inside its
+  envelope produces a valid `CONFIRMED`. The gate catches *out-of-spec* evidence; it does not
+  upgrade "well-formed" into "correct". §2 item 2 above is the reason this is the design.
+- **The device registry is the trust boundary, not the proof.** The circuit proves *a*
+  signature; it cannot prove *whose*. Without `approvedDevice`, anyone could mint a valid
+  `REFUTED` for anyone else's evidence and close the gate at will. The circuit also pins
+  `deviceKeyHash === Poseidon(Ax, Ay)`, so the key claimed in the public signals is the key that
+  actually signed — otherwise a prover would sign with a key of their own and assert an
+  approved hash.
+- **`REFUTED` is a proof, not an absence.** The verdict is constrained in-circuit to the
+  envelope check on the private witness, so `REFUTED` means "this signed reading breaks the
+  rules", and a prover cannot relabel its own reading. Removal of that single constraint is what
+  `test_CannotRelabelAProofAsRefutedWhenItIsInEnvelope` guards.
+
+`verifyEvidence` is `view` per `IVerifier`, so it cannot take a proof as an argument and cannot
+afford a ~300k-gas pairing on every read. The pairing runs once in `submitProof` (permissionless,
+first write wins) and only the verdict is persisted. **An evidence hash above the BN254 field
+prime is refused, not reduced** — `hash` and `hash - SNARK_FIELD` share a field element, so
+reducing would let one attestation read another's verdict. That is a real constraint: about 81%
+of uniformly random bytes32 values, `keccak256` output included, are out of field. Nothing is
+lost (the verdict stays `UNRESOLVED`, which routes to the panel), but check `isProvable(hash)`
+before choosing one, or a claim meant to be machine-checkable silently never becomes so.
 
 Deliberately: **no probabilistic judge touches the mint path.** An earlier proposal was for an
 off-chain model to score "existence probability" and have the contract act on it. A contract
@@ -135,37 +180,75 @@ Each of these exists because its absence was a bug that a green suite walked pas
 - **The bytecode fits.** 22,819 B against the 24,576 B EIP-170 limit — 1,757 B of margin. The
   optimizer was silently off at one point, leaving 38 KB of undeployable bytecode that a
   fully passing test suite was perfectly happy with. `forge build --sizes` is part of the build
-  for that reason.
+  for that reason. The verifier is a **separate contract** (3,573 B), so adding a real proof
+  system cost the token nothing.
+- **A verdict cannot be relabelled, and cannot be claimed by the wrong key.** Both are
+  properties of the circuit, so they are verified by breaking the circuit and confirming the
+  tests go red — not by reading the constraint and nodding. Both were confirmed to go red.
 
 ## Running it
 
 ```bash
 cd ~/galactic-trust
-forge test                        # 125/125, ~5 s
-FOUNDRY_PROFILE=deep forge test   # 5 fuzz suites at 2000 runs + 10 invariants at 128,000 calls each
-forge build --sizes               # MUST stay under 24,576 B
+/home/alexa/.foundry/bin/forge test                        # 150/150, ~6 s
+FOUNDRY_PROFILE=deep /home/alexa/.foundry/bin/forge test   # 5 fuzz at 2000 runs + 10 invariants at 128,000 calls each, ~160 s
+/home/alexa/.foundry/bin/forge build --sizes               # MUST stay under 24,576 B
 ```
+
+### Rebuilding the circuit
+
+Only needed when `circuit/evidence.circom` changes. **Regenerating the keys invalidates every
+proof already submitted on chain**, which is why `circuit_final.zkey`, `verification_key.json`
+and `circuit/Verifier.sol` are committed.
+
+```bash
+bash circuit/build.sh                          # compile + trusted setup + export Verifier.sol
+cd ~/.localtools/snarkjs && node ~/galactic-trust/circuit/genproofs.js   # regenerate the test fixtures
+```
+
+The toolchain lives outside the repo (`~/.local/bin/circom`, `~/.localtools/snarkjs`) because
+`npm` on this box resolves to the Windows binary via `/mnt/c`. The test fixtures are committed
+rather than generated during `forge test`: proving takes ~15 s per proof, and the point of the
+suite is to run on every edit.
+
+`snarkjs`'s `exportSolidityCallData` is the only correct source for the on-chain proof encoding.
+`proof.pi_b` is *not* the layout the generated Solidity verifier wants — each G2 row has its
+coordinates flipped — and copying it verbatim yields a proof that `groth16.verify` accepts and
+the EVM rejects. `genproofs.js` asserts the flip happened rather than assuming it.
 
 Two profiles, and the split is deliberate: the default is fast enough to run on every edit,
 `deep` is what CI and any pre-ship run must use. An invariant suite nobody runs is the same as
 no suite, so the fast default is the honest one.
 
-⚠️ Call `/home/alexa/.foundry/bin/forge` by absolute path inside any script. `/usr/bin/forge`
-is *ZOE*, an unrelated 2013 estimation tool, and it shadows the real binary. Symptom:
-`ZOE ERROR ... zoeParseOptions: unknown option` — and on a build probe it comes back as seven
-consecutive `BUILD FAILED` lines that were never build failures.
+`forge test --match-path test/Invariant.t.sol` also prints a per-operation
+`Calls / Reverts / Discards` table. Read it, not just the PASS line: an operation whose
+revert count matches its call count is failing silently on every invocation while the suite
+stays green. That is how `configureVerifier` once "passed" for a whole session.
+
+⚠️ Call `/home/alexa/.foundry/bin/forge` by absolute path, always. `/usr/bin/forge` is *ZOE*,
+an unrelated 2013 estimation tool, and it shadows the real binary. Bare `forge` works
+interactively and from a login shell, so this looks fine right up until it is run from a
+script: `env -i /bin/sh script.sh` resolves ZOE. Symptom: `ZOE ERROR ...
+zoeParseOptions: unknown option` — and on a build probe it comes back as seven consecutive
+`BUILD FAILED` lines that were never build failures.
 
 ### Layout
 
 ```
-src/GalacticTrust.sol   the token, the attestation lifecycle, and the escrow accounting
-src/IVerifier.sol       tri-state evidence gate: CONFIRMED / REFUTED / UNRESOLVED
-test/GalacticTrust.t.sol   83 unit tests, lifecycle and governance
-test/Adversarial.t.sol      27 tests: hostile owner, broken verifier, ties, no-challenger
-test/Fuzz.t.sol              5 fuzz suites: conservation and terminality
-test/Invariant.t.sol        10 stateful invariants over a 17-operation handler
-script/Deploy.s.sol         Deploy + read-only Verify
-SESSION.md                  the working log, including what has already gone wrong here
+src/GalacticTrust.sol         the token, the attestation lifecycle, and the escrow accounting
+src/IVerifier.sol             tri-state evidence gate: CONFIRMED / REFUTED / UNRESOLVED
+src/CircomVerifier.sol        IVerifier over Groth16 + a governed device registry
+circuit/evidence.circom       proves: approved device signed an in-envelope reading
+circuit/build.sh              circuit -> keys -> Verifier.sol
+circuit/genproofs.js          regenerates the test fixtures (real signatures, real proofs)
+test/GalacticTrust.t.sol      83 unit tests, lifecycle and governance
+test/Adversarial.t.sol        27 tests: hostile owner, broken verifier, ties, no-challenger
+test/CircomVerifier.t.sol     25 tests against real Groth16 proofs
+test/Fuzz.t.sol               5 fuzz suites: conservation and terminality
+test/Invariant.t.sol         10 stateful invariants over a 17-operation handler
+test/fixtures/proofs.json    committed proofs (regenerating them takes minutes)
+script/Deploy.s.sol          Deploy + read-only Verify
+SESSION.md                    the working log, including what has already gone wrong here
 ```
 
 `SESSION.md` §5 is a list of the bugs this project has already shipped and fixed. It is worth
