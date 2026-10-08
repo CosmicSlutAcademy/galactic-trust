@@ -82,17 +82,11 @@ contract CircomVerifierTest is Test {
             "fixture hash must equal publicSignals[0] or the proof cannot verify"
         );
         assertEq(
-            refuted.publicSignals[0],
-            uint256(refuted.contentHash),
-            "refuted: fixture hash must equal publicSignals[0]"
+            refuted.publicSignals[0], uint256(refuted.contentHash), "refuted: fixture hash must equal publicSignals[0]"
         );
-        assertEq(
-            uint8(confirmed.publicSignals[2]), 1, "confirmed fixture must carry verdict 1"
-        );
+        assertEq(uint8(confirmed.publicSignals[2]), 1, "confirmed fixture must carry verdict 1");
         assertEq(uint8(refuted.publicSignals[2]), 0, "refuted fixture must carry verdict 0");
-        assertTrue(
-            confirmed.deviceKeyHash != unapproved.deviceKeyHash, "the two device fixtures must differ"
-        );
+        assertTrue(confirmed.deviceKeyHash != unapproved.deviceKeyHash, "the two device fixtures must differ");
         assertTrue(
             confirmed.contentHash == unapproved.contentHash,
             "the unapproved fixture is meant to target the same evidence"
@@ -183,16 +177,8 @@ contract CircomVerifierTest is Test {
         _submit(refutedTier0, 0);
         _submit(confirmed, 1);
 
-        assertEq(
-            uint8(_verdict(refutedTier0)),
-            uint8(EvidenceVerdict.REFUTED),
-            "5000 is out of spec for UNVERIFIED"
-        );
-        assertEq(
-            uint8(_verdict(confirmed)),
-            uint8(EvidenceVerdict.CONFIRMED),
-            "5000 is in spec for R2"
-        );
+        assertEq(uint8(_verdict(refutedTier0)), uint8(EvidenceVerdict.REFUTED), "5000 is out of spec for UNVERIFIED");
+        assertEq(uint8(_verdict(confirmed)), uint8(EvidenceVerdict.CONFIRMED), "5000 is in spec for R2");
     }
 
     // ---------- the device registry is the trust boundary ----------
@@ -202,9 +188,7 @@ contract CircomVerifierTest is Test {
     /// Reverting the registry check to `true` makes this test fail.
     function test_UnapprovedDeviceCannotSubmitAProof() public {
         assertFalse(verifier.approvedDevice(unapproved.deviceKeyHash), "device B must not start approved");
-        vm.expectRevert(
-            abi.encodeWithSelector(CircomVerifier.DeviceNotApproved.selector, unapproved.deviceKeyHash)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CircomVerifier.DeviceNotApproved.selector, unapproved.deviceKeyHash));
         _submit(unapproved, 1);
         assertFalse(verifier.hasProof(CONFIRMED_HASH, TIER_R2), "nothing recorded");
     }
@@ -221,9 +205,7 @@ contract CircomVerifierTest is Test {
         verifier.approveDevice(unapproved.deviceKeyHash);
         _submit(unapproved, 1);
         assertTrue(verifier.hasProof(confirmed.contentHash, TIER_R2));
-        assertEq(
-            uint8(_verdict(confirmed)), uint8(EvidenceVerdict.CONFIRMED), "B's proof confirms the evidence"
-        );
+        assertEq(uint8(_verdict(confirmed)), uint8(EvidenceVerdict.CONFIRMED), "B's proof confirms the evidence");
     }
 
     function test_OwnerCannotApproveWithoutBeingOwner() public {
@@ -235,9 +217,7 @@ contract CircomVerifierTest is Test {
     function test_RevokedDeviceLosesTheAbilityToSubmitNewProofs() public {
         verifier.revokeDevice(confirmed.deviceKeyHash);
         assertFalse(verifier.approvedDevice(confirmed.deviceKeyHash));
-        vm.expectRevert(
-            abi.encodeWithSelector(CircomVerifier.DeviceNotApproved.selector, confirmed.deviceKeyHash)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CircomVerifier.DeviceNotApproved.selector, confirmed.deviceKeyHash));
         _submit(refuted, 0);
     }
 
@@ -341,9 +321,7 @@ contract CircomVerifierTest is Test {
     function test_RevertWhen_EvidenceHashNotInField() public {
         uint256 prime = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
         vm.expectRevert(abi.encodeWithSelector(CircomVerifier.NotInField.selector, prime));
-        verifier.submitProof(
-            bytes32(prime), TIER_R2, 1, confirmed.deviceKeyHash, confirmed.a, confirmed.b, confirmed.c
-        );
+        verifier.submitProof(bytes32(prime), TIER_R2, 1, confirmed.deviceKeyHash, confirmed.a, confirmed.b, confirmed.c);
     }
 
     /// `hash - SNARK_FIELD` and `hash` encode to the same field element, so accepting
@@ -393,9 +371,7 @@ contract CircomVerifierTest is Test {
     /// First write wins, so a verdict cannot be flipped around a finalization.
     function test_RevertWhen_ProofAlreadySubmitted() public {
         _submit(refuted, 0);
-        vm.expectRevert(
-            abi.encodeWithSelector(CircomVerifier.ProofAlreadySubmitted.selector, REFUTED_HASH, TIER_R2)
-        );
+        vm.expectRevert(abi.encodeWithSelector(CircomVerifier.ProofAlreadySubmitted.selector, REFUTED_HASH, TIER_R2));
         _submit(refuted, 0);
         assertEq(uint8(_verdict(refuted)), uint8(EvidenceVerdict.REFUTED), "verdict unchanged");
     }
@@ -417,9 +393,7 @@ contract CircomVerifierTest is Test {
         _skipWindow();
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.REFUTED)
-            )
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.REFUTED))
         );
         glt.finalizeAttestation(id);
 
@@ -443,9 +417,7 @@ contract CircomVerifierTest is Test {
 
         assertEq(uint8(glt.evidenceVerdict(id)), uint8(EvidenceVerdict.UNRESOLVED));
         vm.expectRevert(
-            abi.encodeWithSelector(
-                GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED)
-            )
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
         );
         glt.finalizeAttestation(id);
         _gltAssertSolvent();

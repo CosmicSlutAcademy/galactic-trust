@@ -151,11 +151,7 @@ contract CircomVerifier is IVerifier, Groth16Verifier, Ownable {
     /// @notice CONFIRMED or REFUTED once an approved device has proved something about
     /// this evidence, UNRESOLVED until then. Never reverts: GLT reads this inside a
     /// try/catch and maps a revert to UNRESOLVED, and a stored-record read cannot fail.
-    function verifyEvidence(bytes32 evidenceHash, uint8 tier)
-        external
-        view
-        returns (EvidenceVerdict)
-    {
+    function verifyEvidence(bytes32 evidenceHash, uint8 tier) external view returns (EvidenceVerdict) {
         Record storage rec = records[_slot(evidenceHash, tier)];
         if (!rec.present) return EvidenceVerdict.UNRESOLVED;
         return rec.verdict == 1 ? EvidenceVerdict.CONFIRMED : EvidenceVerdict.REFUTED;
