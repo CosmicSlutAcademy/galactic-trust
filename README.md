@@ -177,7 +177,7 @@ Each of these exists because its absence was a bug that a green suite walked pas
   unspendable.
 - **A single challenger cannot freeze anything.** Challenges accumulate; escalation is a
   curator-quorum event, not one wallet's decision.
-- **The bytecode fits.** 22,819 B against the 24,576 B EIP-170 limit — 1,757 B of margin. The
+- **The bytecode fits.** 23,020 B against the 24,576 B EIP-170 limit — 1,556 B of margin. The
   optimizer was silently off at one point, leaving 38 KB of undeployable bytecode that a
   fully passing test suite was perfectly happy with. `forge build --sizes` is part of the build
   for that reason. The verifier is a **separate contract** (3,573 B), so adding a real proof
@@ -190,7 +190,7 @@ Each of these exists because its absence was a bug that a green suite walked pas
 
 ```bash
 cd ~/galactic-trust
-/home/alexa/.foundry/bin/forge test                        # 150/150, ~6 s
+/home/alexa/.foundry/bin/forge test                        # 156/156, ~8 s
 FOUNDRY_PROFILE=deep /home/alexa/.foundry/bin/forge test   # 5 fuzz at 2000 runs + 10 invariants at 128,000 calls each, ~160 s
 /home/alexa/.foundry/bin/forge build --sizes               # MUST stay under 24,576 B
 ```

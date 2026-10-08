@@ -852,6 +852,249 @@ contract AdversarialTest is Test {
         assertEq(glt.curatorOpenVotes(curator1), 1, "one vote, one lock");
         _solvent();
     }
+
+    // ---------- audit sweep 2026-10-08 ----------
+
+    /// A forfeited bond must be the amount committed to *this* challenge, not the challenger's
+    /// whole balance. `_forfeitChallengeBonds` and `_penalise` both read `challengeBond[c]`,
+    /// which is the account total, while the amount pledged to one challenge is
+    /// `challengeLock[id][c]`. The per-attestation figure exists precisely to make the release
+    /// exact — its own comment says so — so this is the same per-record/aggregate confusion that
+    /// produced the earlier settlement bugs, here aimed at the challenger's own pocket.
+    ///
+    /// Both settlement legs are covered, because both read the aggregate: the thrown-out
+    /// challenge below goes through `_forfeitChallengeBonds`, the upheld one through `_penalise`.
+    function test_ForfeitTakesTheCommittedBondNotTheWholeBalance() public {
+        // `_fundC` funds 100 and leaves 200 transferred but unspent, so the base bond is 100 and
+        // a 200 top-up brings the account to 300: 100 pledged to each dispute, 100 unpledged.
+        vm.prank(submitter);
+        glt.transfer(challenger1, 200e18);
+        vm.prank(challenger1);
+        glt.fundChallengeBond(200e18);
+        assertEq(glt.challengeBond(challenger1), 300e18);
+
+        bytes32 a = _submit();
+        _sign(a, attester1);
+        bytes32 b = _submit();
+        _sign(b, attester1);
+        // Both challenges are filed before any warp: the window is absolute.
+        vm.prank(challenger1);
+        glt.challengeAttestation(a, "a");
+        vm.prank(challenger1);
+        glt.challengeAttestation(b, "b");
+        assertEq(glt.challengeLock(a, challenger1), CHALLENGE_BOND, "100 pledged to the first");
+        assertEq(glt.challengeLock(b, challenger1), CHALLENGE_BOND, "100 pledged to the second");
+
+        // The first challenge is thrown out, so exactly 100 is forfeit.
+        _skipWindow();
+        vm.prank(curator1);
+        glt.castCuratorVote(a, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(a, false);
+        glt.tallyDispute(a);
+        assertEq(
+            glt.challengeBond(challenger1), 200e18, "the 200 never pledged to this dispute must survive its rejection"
+        );
+        assertEq(glt.challengeLock(b, challenger1), CHALLENGE_BOND, "and the second pledge is untouched");
+
+        // The second is upheld, so exactly 100 more is forfeit.
+        vm.prank(curator1);
+        glt.castCuratorVote(b, true);
+        vm.prank(curator2);
+        glt.castCuratorVote(b, true);
+        glt.tallyDispute(b);
+        assertEq(glt.challengeBond(challenger1), 100e18, "and 100 is all the uphold may take");
+        assertEq(
+            glt.payoutPool(b), CHALLENGE_BOND, "the pool is the bond pledged to this dispute, not the whole balance"
+        );
+
+        // The untouched remainder is free, and withdrawable.
+        assertEq(glt.lockedChallengeBond(challenger1), 0, "no pledge outstanding");
+        vm.prank(challenger1);
+        glt.withdrawChallengeBond();
+        assertEq(glt.challengeBond(challenger1), 0, "the challenger gets their own money back");
+        _solvent();
+    }
+
+    /// The consequence of the above, and the reason it matters. A challenger whose bond was
+    /// burned wholesale by another attestation's settlement holds `challengeBond == 0` while its
+    /// second challenge is still open. On the uphold it forfeits nothing and is paid a share of a
+    /// pool the other challengers funded, so challenging a second time is free — which is the
+    /// entire griefing vector the bond exists to close.
+    function test_AChallengerForfeitingNothingGetsNoShareOfSomeoneElsesPool() public {
+        // challenger1 pledges to both disputes, challenger2 only to the first, outsider only to
+        // the second. The pool on `b` is therefore funded by outsider's forfeiture, which is
+        // what a free-riding challenger1 would be paid out of.
+        vm.prank(submitter);
+        glt.transfer(challenger1, 100e18);
+        vm.prank(challenger1);
+        glt.fundChallengeBond(100e18);
+
+        bytes32 a = _submit();
+        _sign(a, attester1);
+        bytes32 b = _submit();
+        _sign(b, attester1);
+        vm.prank(challenger1);
+        glt.challengeAttestation(a, "a");
+        vm.prank(challenger2);
+        glt.challengeAttestation(a, "c");
+        vm.prank(challenger1);
+        glt.challengeAttestation(b, "b");
+        vm.prank(outsider);
+        glt.challengeAttestation(b, "d");
+
+        // The first challenge is thrown out. challenger1 put up 200 and pledged 100 of it here,
+        // so 100 is forfeit and 100 survives for the second dispute.
+        _skipWindow();
+        vm.prank(curator1);
+        glt.castCuratorVote(a, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(a, false);
+        glt.tallyDispute(a);
+        assertEq(glt.challengeBond(challenger1), 100e18, "only its own 100 was pledged to `a`");
+        assertEq(glt.challengeBond(challenger2), 0, "and challenger2 had only ever pledged that");
+
+        // The second is upheld: 100 from challenger1 and 100 from outsider, split two ways.
+        vm.prank(curator1);
+        glt.castCuratorVote(b, true);
+        vm.prank(curator2);
+        glt.castCuratorVote(b, true);
+        glt.tallyDispute(b);
+
+        assertEq(
+            glt.payoutPool(b),
+            200e18,
+            "the pool is the whole of what was forfeited, so no forfeiture value evaporates and no free share exists"
+        );
+        assertEq(
+            glt.payoutShare(b, challenger1),
+            100e18,
+            "a challenger is paid its own pledge, not a share of someone else's"
+        );
+        assertEq(glt.payoutShare(b, outsider), 100e18, "one pledge, one share");
+        _solvent();
+    }
+
+    /// A panel that never reached quorum has not overruled anything — and on a REFUTED verdict
+    /// the old rule recorded a permanent override anyway.
+    ///
+    /// The 2026-10-07 fix required a strict reject majority, on the reasoning that silence is not
+    /// acquittal and a tie is not acquittal either. It compared `rejectWeight` against
+    /// `upholdWeight` and never checked the snapshotted `curatorQuorumWeight`, which
+    /// `tallyDispute` does check. So a single curator holding 100 against a 150 quorum acquitting
+    /// at expiry set the override, and because the challenge window is absolute and already shut
+    /// the mint gate opened permanently on a refutation that no quorum ever overturned.
+    function test_SubQuorumPanelDoesNotOverrideARefutedVerdict() public {
+        v.setVerdict(EvidenceVerdict.REFUTED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        // One curator acquits. Weight 100 against a 150 snapshotted quorum.
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        assertLt(
+            glt.rejectWeight(id),
+            uint256(glt.getAttestation(id).curatorQuorumWeight),
+            "this panel is deliberately short of quorum"
+        );
+
+        _expire();
+        glt.expireReview(id);
+
+        assertFalse(
+            glt.getAttestation(id).panelOverride,
+            "a panel short of quorum has not overruled the machine, so no override may be recorded"
+        );
+        // The mint gate is shut. A sub-quorum acquittal on a refutation used to open it
+        // permanently; nothing here may reach a mint.
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AttestationNotPending.selector, id));
+        glt.finalizeAttestation(id);
+        _solvent();
+    }
+
+    /// The quorum requirement must not turn a REFUTED expiry into a dead end. A machine verdict
+    /// of REFUTED is a positive finding, so a panel that fails to form a quorum has not disproved
+    /// it — expiry leaves the machine's finding standing and the submitter is penalised.
+    function test_SubQuorumExpiryLeavesARefutationStanding() public {
+        v.setVerdict(EvidenceVerdict.REFUTED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        _expire();
+        glt.expireReview(id);
+
+        assertEq(
+            uint8(glt.getAttestation(id).status),
+            uint8(GalacticTrust.AttestationStatus.SLASHED),
+            "a refutation nobody overturned stands"
+        );
+        assertEq(glt.getAttestation(id).stake, 0, "and the stake is not left stranded");
+        assertFalse(glt.getAttestation(id).panelOverride);
+        _solvent();
+    }
+
+    /// The same quorum gap on the UNRESOLVED side, and this is the path that actually reaches
+    /// `_resolve(false)` with a sub-quorum panel — the REFUTED case never gets there, because
+    /// expiry leaves the refutation standing instead. The existing tie and silence tests cover
+    /// two shapes of a panel that did not rule; this is the third, the one that showed up and
+    /// still lost. A minority acquitting is not a panel that overruled anything.
+    ///
+    /// Note the consequence, which is not a fix but a property of the current design: with no
+    /// override reachable this attestation is PENDING on a verdict that can never be finalized
+    /// and cannot be challenged again, so its stake is stranded. See SESSION.md §5 for why that
+    /// is the lesser evil and what the missing terminal state is.
+    function test_SubQuorumPanelDoesNotOverrideAnUnresolvedVerdict() public {
+        v.setVerdict(EvidenceVerdict.UNRESOLVED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        assertLt(
+            glt.rejectWeight(id),
+            uint256(glt.getAttestation(id).curatorQuorumWeight),
+            "this panel is deliberately short of quorum"
+        );
+
+        _expire();
+        glt.expireReview(id);
+
+        assertFalse(
+            glt.getAttestation(id).panelOverride,
+            "a sub-quorum acquittal is a minority that showed up, not a panel that overruled the machine"
+        );
+        vm.expectRevert(
+            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
+        );
+        glt.finalizeAttestation(id);
+        _solvent();
+    }
+
+    /// A full-quorum acquittal still overrides, so the quorum requirement has not closed the exit
+    /// the override exists to provide. The REFUTED case is the one that matters: two of three
+    /// curators is 200 against a 150 quorum, a clear majority, and it must still mint.
+    function test_FullQuorumAcquittalStillOverridesARefutedVerdict() public {
+        v.setVerdict(EvidenceVerdict.REFUTED);
+        bytes32 id = _submit();
+        _sign(id, attester1);
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        glt.tallyDispute(id);
+
+        assertTrue(glt.getAttestation(id).panelOverride, "a quorum acquittal is a real overruling");
+        glt.finalizeAttestation(id);
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.FINALIZED));
+        _solvent();
+    }
 }
 
 contract MockV is IVerifier {

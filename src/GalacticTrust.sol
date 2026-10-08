@@ -654,8 +654,12 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         if (up + down >= att.curatorQuorumWeight && up != down) revert ReviewAlreadyResolved(id);
 
         // A REFUTED proof is a positive finding, not an absence of one, so expiry cannot
-        // launder it: the submitter is still penalised.
-        if (_verdict(att) == EvidenceVerdict.REFUTED && up >= down) {
+        // launder it: the submitter is still penalised. A panel short of quorum has not
+        // disproved it, and it still cannot overrule it (`panelOverride` needs the quorum),
+        // so leaving the finding standing is the only outcome that both preserves the
+        // refutation and terminates. Without this the sub-quorum acquittal fell through to
+        // `_resolve(false)` with no override reachable and the stake locked forever.
+        if (_verdict(att) == EvidenceVerdict.REFUTED && (up + down < att.curatorQuorumWeight || up >= down)) {
             _resolve(id, att, true);
             return;
         }
@@ -695,7 +699,17 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             // since the challenge window is already closed that flag was permanent, silent
             // approval. Only a strict reject majority is an overruling. Silence is not
             // acquittal, and a tie is not acquittal either.
-            if (_verdict(att) != EvidenceVerdict.CONFIRMED && rejectWeight[id] > upholdWeight[id]) {
+            //
+            // Reaching the snapshotted quorum is the other half of that, and it was missing
+            // where `tallyDispute` has it. A reject majority short of quorum is a minority
+            // that showed up, not a panel that ruled: on a REFUTED verdict one curator holding
+            // 100 against a 150 quorum acquitting at expiry opened the mint gate permanently
+            // on a refutation nothing had overturned. Both conditions now hold together.
+            if (
+                _verdict(att) != EvidenceVerdict.CONFIRMED
+                    && upholdWeight[id] + rejectWeight[id] >= att.curatorQuorumWeight
+                    && rejectWeight[id] > upholdWeight[id]
+            ) {
                 att.panelOverride = true;
             }
             _forfeitChallengeBonds(id);
@@ -711,10 +725,16 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         address[] storage ch = challengers[id];
         for (uint256 i = 0; i < ch.length;) {
             address c = ch[i];
-            uint256 amount = challengeBond[c];
+            // The figure pledged to *this* challenge, not the account total. A challenger may
+            // hold bond committed to other, still-open disputes, and forfeiting on one of them
+            // must not reach into that: reading `challengeBond[c]` here burned the whole
+            // balance, which left the second dispute's pledge already gone — so that
+            // challenger forfeited nothing on it and drew a share of a pool other people
+            // funded. That is a free second challenge, which is the whole point of the bond.
+            uint256 amount = challengeLock[id][c];
             _releaseLock(id, c);
             if (amount > 0) {
-                challengeBond[c] = 0;
+                challengeBond[c] -= amount;
                 outstandingChallengeBond -= amount;
                 _burn(address(this), amount);
                 emit ChallengerBondForfeited(id, c, amount);
@@ -817,11 +837,13 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         }
 
         // Forfeited bonds from challengers whose dispute lost, added to the payout pool.
+        // The pledged figure per challenge, for the same reason `_forfeitChallengeBonds` uses
+        // it: the account total would pull in bond committed to a dispute that is still open.
         uint256 forfeited;
         address[] storage ch = challengers[id];
         uint256 n = ch.length;
         for (uint256 i = 0; i < n;) {
-            forfeited += challengeBond[ch[i]];
+            forfeited += challengeLock[id][ch[i]];
             unchecked {
                 ++i;
             }
@@ -834,9 +856,10 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         // remaining challengers revert with the rest of the forfeiture stranded.
         for (uint256 i = 0; i < n;) {
             address c = ch[i];
+            uint256 pledged = challengeLock[id][c];
             _releaseLock(id, c);
             payoutShare[id][c] = each;
-            challengeBond[c] = 0;
+            challengeBond[c] -= pledged;
             unchecked {
                 ++i;
             }

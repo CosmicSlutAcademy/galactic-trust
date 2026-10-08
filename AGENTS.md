@@ -11,7 +11,7 @@ fund-loss bug this project has already shipped and fixed, §6 the ordered next a
 
 ```bash
 cd ~/galactic-trust
-/home/alexa/.foundry/bin/forge test                        # 150/150, ~6 s
+/home/alexa/.foundry/bin/forge test                        # 156/156, ~8 s
 FOUNDRY_PROFILE=deep /home/alexa/.foundry/bin/forge test   # ~160 s, pre-ship
 /home/alexa/.foundry/bin/forge build --sizes               # MUST stay under 24,576 B
 ```
@@ -23,7 +23,7 @@ shadows the real binary on non-interactive shells. `SESSION.md` §3 says PATH is
 `ZOE ERROR ... zoeParseOptions: unknown option`, or seven consecutive `BUILD FAILED` lines
 that were never build failures.
 
-Current size: 22,819 B, **1,757 B of margin**. Roughly one and a half small features. Run
+Current size: 23,020 B, **1,556 B of margin**. Roughly one and a half small features. Run
 `--sizes` on every change and report the delta.
 
 `CircomVerifier` is a **separate contract** (3,573 B). Anything implementing `IVerifier`
@@ -128,7 +128,7 @@ Two rules that look wrong but are not:
 
 - **Do not spend EIP-170 margin casually.** It is a hard cliff that makes the contract
   undeployable, and gas is a soft recurring cost. When they conflict, margin wins. Current
-  margin is 1,757 B; `optimizer_runs` 20 → 1 buys 47 B for ~1.6% gas if needed.
+  margin is 1,556 B; `optimizer_runs` 20 → 1 buys 47 B for ~1.6% gas if needed.
 - **Do not add a probabilistic signal to the mint path.** See the design rules above.
 - **Do not reintroduce single-challenger escalation.** Challenges accumulate; escalation is a
   curator-quorum event. `test_ChallengeDoesNotFreezeSignatures` guards this.
@@ -161,14 +161,15 @@ suite means the happy path works, nothing more.
 ## Layout
 
 ```
-src/GalacticTrust.sol     the token, attestation lifecycle, escrow accounting (939 lines)
+src/GalacticTrust.sol     the token, attestation lifecycle, escrow accounting (965 lines)
 src/IVerifier.sol         tri-state gate: CONFIRMED / REFUTED / UNRESOLVED
 src/CircomVerifier.sol    IVerifier over Groth16 + a governed device registry
 circuit/evidence.circom   proves: approved device signed an in-envelope reading
 circuit/build.sh          circuit -> keys -> Verifier.sol (re-running it invalidates proofs)
+script/vacuity-check.sh     reverts each fix in turn; every new property must go red
 circuit/genproofs.js      regenerates test/fixtures/proofs.json (real signatures + proofs)
 test/GalacticTrust.t.sol  83 unit tests, lifecycle + governance
-test/Adversarial.t.sol    27 tests: hostile owner, broken verifier, ties, no-challenger
+test/Adversarial.t.sol    33 tests: hostile owner, broken verifier, ties, no-challenger
 test/CircomVerifier.t.sol 25 tests against real Groth16 proofs
 test/Fuzz.t.sol            5 fuzz suites: conservation + terminality
 test/Invariant.t.sol      10 stateful invariants over a 17-operation handler
