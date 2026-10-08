@@ -419,6 +419,7 @@ contract InvariantTest is StdInvariant, Test {
             if (
                 a.status == GalacticTrust.AttestationStatus.FINALIZED
                     || a.status == GalacticTrust.AttestationStatus.SLASHED
+                    || a.status == GalacticTrust.AttestationStatus.EXPIRED
             ) {
                 assertEq(a.stake, 0, "a terminal attestation still counts stake");
             }

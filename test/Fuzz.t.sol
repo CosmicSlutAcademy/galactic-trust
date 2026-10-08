@@ -164,11 +164,29 @@ contract FuzzTest is Test {
         _assertSolventFull();
     }
 
-    /// @dev Expiry always reaches a terminal state, whatever the vote pattern.
-    function testFuzz_ExpiryAlwaysTerminates(uint8 pattern) public {
+    /// @dev Expiry always reaches a *reachable* terminal state, whatever the vote pattern and
+    /// whatever the evidence says.
+    ///
+    /// Two things were wrong with this property before, and both are the reason the stranded
+    /// stake survived it. It counted `PENDING` as terminal, and a PENDING attestation that can
+    /// never be finalized is precisely the defect — so the property was green on the bug. And
+    /// the fixture set no verifier, so every verdict was `CONFIRMED`, and the whole non-CONFIRMED
+    /// half of the contract was unreachable. Same root cause as the invariant fixture in
+    /// §6.3: deploy with `address(0)` and the interesting half of a contract is dead code.
+    ///
+    /// The verdict is fuzzed now, and a post-expiry `PENDING` has to prove it can still reach
+    /// `FINALIZED`. The precondition reads `evidenceVerdict` and `panelOverride`, which are
+    /// exactly the two things `finalizeAttestation` gates on — not a different source of truth.
+    function testFuzz_ExpiryAlwaysTerminates(uint8 pattern, uint8 verdictSeed) public {
         vm.prank(owner);
         glt.setChallengeBondAmount(10e18);
         glt.setAttesterBondAmount(10e18);
+
+        FuzzV fv = new FuzzV(EvidenceVerdict.CONFIRMED);
+        vm.prank(owner);
+        glt.setVerifier(address(fv));
+        EvidenceVerdict verdict = _pickVerdict(verdictSeed);
+        fv.setVerdict(verdict);
 
         bytes32 secret = keccak256(abi.encode("exp", pattern));
         vm.prank(submitter);
@@ -185,6 +203,11 @@ contract FuzzTest is Test {
 
         vm.warp(block.timestamp + glt.CHALLENGE_WINDOW() + 1);
         // pattern 0 = no votes, 1 = uphold, 2 = reject, 3 = tie (two curators, opposite)
+        if (verdict == EvidenceVerdict.CONFIRMED) {
+            // With nothing to review, a vote or an expiry is refused outright. Exercising the
+            // referral path on a CONFIRMED verdict would only test the guard.
+            return;
+        }
         if (pattern == 1 || pattern == 2) {
             vm.prank(curator1);
             glt.castCuratorVote(id, pattern == 1);
@@ -207,12 +230,32 @@ contract FuzzTest is Test {
         }
 
         GalacticTrust.AttestationStatus s = glt.getAttestation(id).status;
-        assertTrue(
-            s == GalacticTrust.AttestationStatus.PENDING || s == GalacticTrust.AttestationStatus.FINALIZED
-                || s == GalacticTrust.AttestationStatus.SLASHED,
-            "terminal state reached"
-        );
+        if (s == GalacticTrust.AttestationStatus.PENDING) {
+            // Only legitimate if it can still be finalized. A PENDING attestation with a
+            // non-CONFIRMED verdict and no override has no exit left at all -- the challenge
+            // window is shut, the panel has ruled, and no expiry will change the verdict.
+            bool finalizable =
+                glt.evidenceVerdict(id) == EvidenceVerdict.CONFIRMED || glt.getAttestation(id).panelOverride;
+            assertTrue(
+                finalizable,
+                "a PENDING attestation after expiry can never be finalized: the submitter's stake is stranded"
+            );
+        } else {
+            assertTrue(
+                s == GalacticTrust.AttestationStatus.FINALIZED || s == GalacticTrust.AttestationStatus.SLASHED
+                    || s == GalacticTrust.AttestationStatus.EXPIRED,
+                "terminal state reached"
+            );
+        }
         _assertSolventFull();
+    }
+
+    /// @dev Maps a fuzzed byte onto the three verdicts. `bound` on an enum needs an explicit
+    /// range, and hand-rolling the modulo keeps all three reachable.
+    function _pickVerdict(uint8 seed) internal pure returns (EvidenceVerdict) {
+        if (seed % 3 == 0) return EvidenceVerdict.CONFIRMED;
+        if (seed % 3 == 1) return EvidenceVerdict.REFUTED;
+        return EvidenceVerdict.UNRESOLVED;
     }
 
     /// @dev The owner cannot burn escrowed tokens no matter what it tries. Fuzzed amounts
@@ -327,5 +370,23 @@ contract FuzzTest is Test {
 
     function _assertSolventFull() internal view {
         assertGe(glt.balanceOf(address(glt)), glt.totalLiabilities(), "held >= owed");
+    }
+}
+
+/// Switchable tri-state gate for the expiry fuzz. Deployed per call so each run starts
+/// CONFIRMED and is moved to the fuzzed verdict deliberately, rather than inheriting one.
+contract FuzzV is IVerifier {
+    EvidenceVerdict public verdict;
+
+    constructor(EvidenceVerdict v) {
+        verdict = v;
+    }
+
+    function setVerdict(EvidenceVerdict v) external {
+        verdict = v;
+    }
+
+    function verifyEvidence(bytes32, uint8) external view returns (EvidenceVerdict) {
+        return verdict;
     }
 }

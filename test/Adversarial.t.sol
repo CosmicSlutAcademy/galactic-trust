@@ -209,6 +209,9 @@ contract AdversarialTest is Test {
     /// A broken verifier across the whole lifecycle: nothing freezes, nothing mints silently.
     function test_BrokenVerifierEndToEnd() public {
         v.setShouldRevert(true);
+        // Captured before the submission, so the comparison is a true net movement: the stake
+        // goes out at `submitAttestation` and has to come back.
+        uint256 balance = glt.balanceOf(submitter);
         bytes32 id = _submit();
         _sign(id, attester1);
         _sign(id, attester2);
@@ -219,11 +222,13 @@ contract AdversarialTest is Test {
         glt.finalizeAttestation(id);
         assertEq(glt.totalSupply(), supply, "no mint while unresolved");
 
-        // expiry cannot launder it either
+        // Expiry cannot launder it either -- and it now also releases the stake, because an
+        // outage is exactly the case where holding a submitter's capital indefinitely is worst.
         _expire();
         glt.expireReview(id);
         assertEq(glt.totalSupply(), supply, "still no mint");
-        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.PENDING));
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.EXPIRED));
+        assertEq(glt.balanceOf(submitter), balance, "and the stake is handed back rather than stranded");
         _solvent();
     }
 
@@ -685,16 +690,15 @@ contract AdversarialTest is Test {
         _expire();
         glt.expireReview(id);
 
-        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.PENDING));
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.EXPIRED));
         assertFalse(
             glt.getAttestation(id).panelOverride,
             "a panel that deadlocked has not overruled anything, so no override may be recorded"
         );
         // And so the mint gate stays shut. This is the part that mattered: without the guard
-        // this call succeeded and paid the submitter.
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
-        );
+        // this call succeeded and paid the submitter. The terminal state is now EXPIRED, so the
+        // refusal is `AttestationNotPending` rather than the verdict check.
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AttestationNotPending.selector, id));
         glt.finalizeAttestation(id);
         _solvent();
     }
@@ -710,9 +714,7 @@ contract AdversarialTest is Test {
 
         glt.expireReview(id);
         assertFalse(glt.getAttestation(id).panelOverride, "nobody voted, so nobody overrode anything");
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
-        );
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AttestationNotPending.selector, id));
         glt.finalizeAttestation(id);
         _solvent();
     }
@@ -1043,10 +1045,9 @@ contract AdversarialTest is Test {
     /// two shapes of a panel that did not rule; this is the third, the one that showed up and
     /// still lost. A minority acquitting is not a panel that overruled anything.
     ///
-    /// Note the consequence, which is not a fix but a property of the current design: with no
-    /// override reachable this attestation is PENDING on a verdict that can never be finalized
-    /// and cannot be challenged again, so its stake is stranded. See SESSION.md §5 for why that
-    /// is the lesser evil and what the missing terminal state is.
+    /// It terminates as `EXPIRED` with the stake returned rather than locking, which is the
+    /// whole point: no override was recorded, so no reward is minted, but the capital goes back
+    /// to the submitter. See `test/Expiry.t.sol`.
     function test_SubQuorumPanelDoesNotOverrideAnUnresolvedVerdict() public {
         v.setVerdict(EvidenceVerdict.UNRESOLVED);
         bytes32 id = _submit();
@@ -1068,9 +1069,8 @@ contract AdversarialTest is Test {
             glt.getAttestation(id).panelOverride,
             "a sub-quorum acquittal is a minority that showed up, not a panel that overruled the machine"
         );
-        vm.expectRevert(
-            abi.encodeWithSelector(GalacticTrust.EvidenceNotFinalizable.selector, id, uint8(EvidenceVerdict.UNRESOLVED))
-        );
+        assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.EXPIRED));
+        vm.expectRevert(abi.encodeWithSelector(GalacticTrust.AttestationNotPending.selector, id));
         glt.finalizeAttestation(id);
         _solvent();
     }

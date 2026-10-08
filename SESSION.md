@@ -3,9 +3,9 @@
 
 **Last updated:** 2026-10-08
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
-**Location:** `~/galactic-trust` (1,159 src / 4,813 test lines Solidity + one circom circuit)
-**Status:** 156/156 tests green on both profiles (default ~8 s; `deep` = 5 fuzz suites at
-2000 runs + 10 invariants at 128,000 calls each = 187 s), deploy script exercised against
+**Location:** `~/galactic-trust` (1,214 src / 4,955 test lines Solidity + one circom circuit)
+**Status:** 164/164 tests green on both profiles (default ~8 s; `deep` = 5 fuzz suites at
+2000 runs + 10 invariants at 128,000 calls each = 200 s), deploy script exercised against
 Anvil, a real Groth16 verifier built and tested against genuine proofs, NOT deployed to a
 public network, NOT audited.
 
@@ -27,7 +27,7 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 |---|---|
 | Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **use the absolute path in scripts, see §3** |
 | `GalacticTrust.sol` | ✅ compiles, quorum attestation + challenge window + slashing |
-| Test suite | ✅ 156/156 passing (83 unit + 33 adversarial + 5 fuzz + 10 invariant + 25 verifier) |
+| Test suite | ✅ 156/156 passing (83 unit + 33 adversarial + 8 expiry + 5 fuzz + 10 invariant + 25 verifier) |
 | Tri-state evidence gate | ✅ `CONFIRMED`/`REFUTED`/`UNRESOLVED`, enforced at finalize |
 | Verifier outage failsafe | ✅ a reverting verifier → `UNRESOLVED`, never a protocol halt |
 | Curator quorum snapshot | ✅ snapshotted at submission, owner cannot move it mid-dispute |
@@ -39,7 +39,7 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 | Escrow solvency invariant | ✅ `totalLiabilities()` accounted on every movement |
 | Owner burn limited to unbacked balance | ✅ `recoverExcessStake` cannot touch live escrow |
 | Challenge bond locked while challenge open | ✅ `lockedChallengeBond` |
-| Contract size within EIP-170 | ✅ 23,020 B — 1,556 B margin |
+| Contract size within EIP-170 | ✅ 23,169 B — 1,407 B margin |
 | **Real ZK verifier** | ✅ **BUILT — `circuit/evidence.circom` + `src/CircomVerifier.sol`, Groth16, 25 tests on real proofs. NOT wired into any deployment** |
 | **Verifier trust boundary** | ✅ **device registry; `deviceKeyHash` bound to the signing key in-circuit — see §5** |
 | **Evidence-hash field check** | ⚠️ **`_inField` refuses out-of-field hashes. ~81% of random bytes32 are out of field — see §5** |
@@ -540,24 +540,45 @@ short of quorum can neither overrule a refutation nor be overruled by it, so exp
 the machine's finding standing and penalises the submitter, which terminates. A quorum of
 curators can still overrule it.
 
-**3. OPEN — an `UNRESOLVED` attestation can be stranded permanently.** This one is *not* fixed
-and is the most important thing in this entry. `expireReview` on a `UNRESOLVED` attestation
-whose panel tied or was silent leaves it `PENDING` with `panelOverride` false. From there:
-`finalizeAttestation` reverts `EvidenceNotFinalizable` on a verdict that can never change to
-`CONFIRMED` (only the owner sets the verifier, and a broken verifier is the normal cause);
-`challengeAttestation` reverts `ChallengeWindowClosed`; `castCuratorVote` reverts
-`AlreadyRuled` on `panelSettled`; `tallyDispute` reverts `CuratorsSplit`; `expireReview` again
-is a no-op because `curatorVoters` is empty. **`minStake` per attestation is held by the
-contract with no exit at all.** This is not new — `test_TiedPanelAtExpiryDoesNotOverrideTheMachine`
-and `test_UnattendedExpiryDoesNotOverrideTheMachine` pin it as intended — and finding 2 makes it
-slightly broader. Under a reverting verifier *every* attestation is `UNRESOLVED`, so an outage
-strands a stake per attestation rather than one.
+**3. CLOSED 2026-10-08 — `EXPIRED`, a fourth terminal state.** An `UNRESOLVED` attestation whose
+panel tied or was silent at expiry was `PENDING` with no reachable exit: `finalizeAttestation`
+reverts `EvidenceNotFinalizable` on a verdict that can never change, `challengeAttestation`
+reverts `ChallengeWindowClosed`, `castCuratorVote` reverts `AlreadyRuled` on `panelSettled`,
+`tallyDispute` reverts `CuratorsSplit`, and `expireReview` again is a no-op because
+`curatorVoters` is empty. **`minStake` per attestation was held by the contract forever.**
+Under a reverting verifier every attestation is `UNRESOLVED`, so an outage stranded a stake per
+submission rather than one record.
 
-Why it was left alone: the alternative to a stranded stake is a minted reward on evidence the
-gate refused to confirm, and a lock strands one submitter's own funds while a mint dilutes
-every holder. That is a call about what GLT promises, not a bug fix, and `_resolve` is on the
-ask-first list. It needs a third terminal state — release the stake, mint nothing, e.g. a new
-`EXPIRED` status — which costs EIP-170 bytes out of the remaining 1,556 B. **§6 item 7.**
+`_resolve` now settles it: a non-`CONFIRMED` verdict with no reachable override marks the
+attestation `EXPIRED` and returns the stake, minting nothing. That is the only settlement
+consistent with `expireReview`'s own rule that an unreachable panel cannot punish a submitter
+who did nothing wrong — the claim was neither certified nor refuted, so it earns nothing and
+costs nothing. Minting here would have been a third route to supply on evidence the gate
+refused to confirm. Reachable only from `expireReview`: on the `tallyDispute` path quorum is
+met and ties are refused, so either the verdict is `CONFIRMED` or the override is set and the
+attestation can still finalize.
+
+`revealSecret` deliberately still serves an `EXPIRED` attestation, unlike `SLASHED` and
+`FINALIZED`. Disclosure is safe there precisely because the record is terminal and can no longer
+be moved, and it preserves the audit trail.
+
+**Two properties were counting the bug as correct.** `testFuzz_ExpiryAlwaysTerminates` accepted
+`PENDING` as terminal — and a `PENDING` attestation that can never be finalized *is* the defect,
+so the property was green on the bug. Worse, its fixture set **no verifier at all**, so every
+verdict was `CONFIRMED` and the entire non-`CONFIRMED` half was unreachable. Same root cause as
+the §6.3 invariant fixture: deploy with `address(0)` and half the contract is dead code. The
+verdict is fuzzed now and a post-expiry `PENDING` has to prove it can still reach `FINALIZED`.
+
+**Minor, not fixed:** `expireReview` omits the `NoChallengesToResolve` guard that
+`castCuratorVote` and `tallyDispute` both have, so on a `CONFIRMED` unchallenged attestation it
+runs to completion and emits `ReviewExpired` on a record nobody disputed, setting `panelSettled`
+on the way through. No funds move and the attestation still finalizes with its reward — it is a
+false event rather than a loss. Pinned in `test_ConfirmedAttestationIsUnaffected` and left for the
+auditor, since a guard costs margin that has not been allocated.
+
+`test/Expiry.t.sol` covers the state; 156 → 164 tests, runtime 23,020 → 23,169 B, margin 1,556 →
+**1,407 B**. All five fixes verified by revert-and-see-red in `script/vacuity-check.sh`, and
+`script/pre-ship.sh` now runs the deep profile and reads the handler revert column in one shot.
 
 #### How these were verified
 
@@ -919,7 +940,7 @@ Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4
    an engineering one, and it belongs in the audit conversation.
 3. ☐ **Testnet deploy**, then `Verify` against it. Anvil confirmed the mechanics and surfaced
    two script bugs; a testnet will confirm the gas costs, which no local run has.
-4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,556 B**, down from
+4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,407 B**, down from
    1,757 B: the 2026-10-08 audit sweep spent 201 B on two fund-loss fixes, which is what margin
    is for. The verifier is a separate 3,618 B contract and cost the token nothing. If a future
    change overruns, take `optimizer_runs` 20 → 1 (buys 47 B for ~1.6% gas, measured) or cut
@@ -935,20 +956,15 @@ Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4
    exists to prevent.
 6. ☐ **Legal wrapper** (Wyoming DAO LLC) if this is ever to hold real money. Nothing here is
    legally binding; §2 records why that is not a Solidity problem at all.
-7. ☐ **New, 2026-10-08 — and it is a design call, not a bug.** An `UNRESOLVED` attestation
-   whose panel tied or stayed silent at expiry is `PENDING` with no reachable exit, and its
-   `minStake` is held by the contract forever. Full mechanism, and why the alternative is
-   worse, in §5 "The audit-sweep findings" finding 3. Needs a third terminal state: release the
-   stake, mint nothing, e.g. a new `EXPIRED` status. **Do not fix it by setting
-   `panelOverride` on a deadlocked panel** — that is the 2026-10-05 bug, reintroduced.
-   Whether to spend the remaining margin on it, or to hand it to the auditor as a known and
-   documented limitation, is the actual question.
+7. ✅ **Stranded stake — CLOSED 2026-10-08.** An `UNRESOLVED` attestation whose panel tied or
+   stayed silent at expiry used to hold `minStake` with no exit at all. The `EXPIRED` terminal
+   state now returns the stake and mints nothing. §5 "The audit-sweep findings" finding 3.
 ### Not on the list, deliberately
 
 - **Off-grid settlement.** §2 item 1. Physically impossible as specified; a store-and-forward
   design is salvageable but is a different project.
 - **Pillar 2, access-gating / query fees.** Unbuilt. Adding it now would spend scarce EIP-170
-  margin before an audit has said what the 1,556 B should be spent on.
+  margin before an audit has said what the 1,407 B should be spent on.
 - **Removing `secretRevealed` / `disputeUpheld` from the ABI.** Both have 0 external call sites
   but are meaningful public record — `secretRevealed` is what a consumer reads to know a
   pre-image was disclosed, and `disputeUpheld` is the ruling. Removing them to save bytes would

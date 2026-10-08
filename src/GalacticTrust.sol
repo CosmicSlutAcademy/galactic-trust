@@ -24,7 +24,13 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
         NONE,
         PENDING,
         FINALIZED,
-        SLASHED
+        SLASHED,
+        /// @dev Survived the review window with no ruling for or against it: a non-CONFIRMED
+        /// verdict and no override the panel could reach. Terminal, and the submitter's stake is
+        /// returned rather than left held, because the contract never decided anything about
+        /// this claim. Without this state a deadlocked or silent panel stranded `minStake`
+        /// permanently — see `test/Expiry.t.sol`.
+        EXPIRED
     }
 
     struct Attester {
@@ -705,12 +711,45 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             // that showed up, not a panel that ruled: on a REFUTED verdict one curator holding
             // 100 against a 150 quorum acquitting at expiry opened the mint gate permanently
             // on a refutation nothing had overturned. Both conditions now hold together.
+            // Read once. The verifier is external, so two reads is two calls to something that
+            // could in principle answer differently, and the override decision and the release
+            // below must agree on the same verdict.
+            EvidenceVerdict verdict = _verdict(att);
             if (
-                _verdict(att) != EvidenceVerdict.CONFIRMED
-                    && upholdWeight[id] + rejectWeight[id] >= att.curatorQuorumWeight
+                verdict != EvidenceVerdict.CONFIRMED && upholdWeight[id] + rejectWeight[id] >= att.curatorQuorumWeight
                     && rejectWeight[id] > upholdWeight[id]
             ) {
                 att.panelOverride = true;
+            }
+            // Reachable only from `expireReview`: `tallyDispute` reaches quorum and refuses a
+            // tie, so on that path either the verdict is CONFIRMED or the override is set, and
+            // either way the attestation can still finalize. Here it can be neither — a
+            // non-CONFIRMED verdict with no override the panel could reach.
+            //
+            // That combination used to strand the submitter's stake with no exit at all. The
+            // challenge window is absolute and shut, `panelSettled` refuses another ballot, no
+            // verdict can change without the owner replacing the verifier, and `expireReview`
+            // again is a no-op because `curatorVoters` is empty. Under a reverting verifier every
+            // attestation lands here, so an outage stranded a stake per submission.
+            //
+            // The settlement is the only one consistent with this function's own rule that an
+            // unreachable panel cannot punish a submitter who did nothing wrong: the stake goes
+            // back and no reward is minted. The claim was neither certified nor refuted, so it
+            // earns nothing and costs nothing. Minting here would be a third route to supply on
+            // evidence the gate refused to confirm, which is the thing the tri-state gate exists
+            // to prevent.
+            if (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride) {
+                att.status = AttestationStatus.EXPIRED;
+                if (att.stake > 0) {
+                    totalStaked -= att.stake;
+                    _update(address(this), att.submitter, att.stake);
+                    // Clear the record, not just the book, exactly as `finalizeAttestation`
+                    // does. A terminal attestation still reporting stake would over-count for
+                    // anything integrating on `stake`, and `totalLiabilities` is unaffected
+                    // either way — which is precisely why it needs the same discipline as the
+                    // finalize leg.
+                    att.stake = 0;
+                }
             }
             _forfeitChallengeBonds(id);
             _clear(challengers[id]);
