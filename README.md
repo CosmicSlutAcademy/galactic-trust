@@ -37,13 +37,13 @@ Two consequences worth stating plainly:
 
 - No external audit has been done. This is the single biggest gap.
 - There is now a real verifier. `circuit/evidence.circom` + `src/CircomVerifier.sol` implement
-  `IVerifier` against a Groth16 proof system, exercised by 25 tests running real proofs. It is
+  `IVerifier` against a Groth16 proof system, exercised by 27 tests running real proofs. It is
   **not** set on any deployment — `verifier` is still `address(0)` unless you pass `VERIFIER`
   to the deploy script — so in a default deployment every verdict is still `CONFIRMED`.
 - What a `CONFIRMED` means is narrow: an *approved device key* signed a reading that fits its
   declared tier's numeric envelope. It does not mean the reading is true. See below.
 - The repository is at `~/galactic-trust`, built with Foundry 1.5.1, Solidity 0.8.33,
-  OpenZeppelin 5.7.0. 150 tests pass, including 10 stateful invariants over a 17-operation
+  OpenZeppelin 5.7.0. 166 tests pass, including 10 stateful invariants over a 17-operation
   handler.
 
 The three pillars of the original design could not be built as written, and the reasons are
@@ -180,7 +180,7 @@ Each of these exists because its absence was a bug that a green suite walked pas
 - **The bytecode fits.** 23,169 B against the 24,576 B EIP-170 limit — 1,407 B of margin. The
   optimizer was silently off at one point, leaving 38 KB of undeployable bytecode that a
   fully passing test suite was perfectly happy with. `forge build --sizes` is part of the build
-  for that reason. The verifier is a **separate contract** (3,573 B), so adding a real proof
+  for that reason. The verifier is a **separate contract** (3,816 B), so adding a real proof
   system cost the token nothing.
 - **A verdict cannot be relabelled, and cannot be claimed by the wrong key.** Both are
   properties of the circuit, so they are verified by breaking the circuit and confirming the
@@ -190,7 +190,7 @@ Each of these exists because its absence was a bug that a green suite walked pas
 
 ```bash
 cd ~/galactic-trust
-/home/alexa/.foundry/bin/forge test                        # 164/164, ~8 s
+/home/alexa/.foundry/bin/forge test                        # 166/166, ~5 s
 FOUNDRY_PROFILE=deep /home/alexa/.foundry/bin/forge test   # 5 fuzz at 2000 runs + 10 invariants at 128,000 calls each, ~160 s
 /home/alexa/.foundry/bin/forge build --sizes               # MUST stay under 24,576 B
 ```
@@ -243,7 +243,7 @@ circuit/build.sh              circuit -> keys -> Verifier.sol
 circuit/genproofs.js          regenerates the test fixtures (real signatures, real proofs)
 test/GalacticTrust.t.sol      83 unit tests, lifecycle and governance
 test/Adversarial.t.sol        27 tests: hostile owner, broken verifier, ties, no-challenger
-test/CircomVerifier.t.sol     25 tests against real Groth16 proofs
+test/CircomVerifier.t.sol     27 tests against real Groth16 proofs
 test/Fuzz.t.sol               5 fuzz suites: conservation and terminality
 test/Invariant.t.sol         10 stateful invariants over a 17-operation handler
 test/fixtures/proofs.json    committed proofs (regenerating them takes minutes)

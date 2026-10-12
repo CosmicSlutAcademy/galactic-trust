@@ -447,6 +447,55 @@ contract CircomVerifierTest is Test {
         assertEq(uint8(GalacticTrust.EvidenceTier.R2), TIER_R2);
     }
 
+    // ---------- commit-reveal helpers ----------
+
+    /// The helper has to produce the hash `GalacticTrust` itself accepts, or an integrator
+    /// who searches with it commits to a pre-image the contract will never honour. This
+    /// drives a real `checkSecret` and a real `revealSecret` through `GalacticTrust`, so the
+    /// two formulas are compared by the contract rather than by a second copy of the formula
+    /// in this file — which is what a drift between them would otherwise hide behind.
+    function test_ContentCommitmentMatchesGltCommitReveal() public {
+        _setUpGlt();
+
+        bytes32 secret = _findProvableSecret(submitter);
+        bytes32 contentHash = verifier.contentCommitment(submitter, secret);
+
+        vm.prank(submitter);
+        bytes32 id = glt.submitAttestation(contentHash, secret, GalacticTrust.EvidenceTier.R2);
+
+        assertTrue(glt.checkSecret(id, secret), "the helper's hash must satisfy checkSecret");
+
+        // And the same pre-image must be the one `revealSecret` accepts. `secretRevealed` can
+        // only flip on a valid candidate, so this fails if revealSecret's formula ever
+        // diverges from the helper's.
+        _skipWindow();
+        vm.prank(curator1);
+        glt.revealSecret(id, secret);
+        assertTrue(glt.getAttestation(id).secretRevealed, "the helper's hash must satisfy revealSecret");
+        _gltAssertSolvent();
+    }
+
+    /// `isSecretProvable` is `isProvable` applied to the commitment, and the search it exists
+    /// to make cheap has to actually terminate: about one candidate in five clears the field,
+    /// so a sweep of a few dozen is the normal cost, not a hunt.
+    function test_IsSecretProvableAgreesWithIsProvableAndIsCheapToSatisfy() public view {
+        uint256 tried;
+        for (uint256 i = 0; i < 256; ++i) {
+            bytes32 secret = keccak256(abi.encode("candidate", i));
+            bool provable = verifier.isSecretProvable(submitter, secret);
+            assertEq(
+                provable,
+                verifier.isProvable(verifier.contentCommitment(submitter, secret)),
+                "isSecretProvable must agree with isProvable on the commitment"
+            );
+            ++tried;
+            if (provable) break;
+        }
+        // Guard the "cheap" claim rather than assert it: 128 misses has probability ~4e-13,
+        // so this cannot flake, and it would fail if the search ever stopped finding a home.
+        assertLe(tried, 128, "a provable secret must turn up within 128 candidates");
+    }
+
     // ---------- GLT helpers ----------
 
     function _setUpGlt() internal {
@@ -499,6 +548,16 @@ contract CircomVerifierTest is Test {
         id = glt.submitAttestation(
             contentHash, keccak256(abi.encode("secret", secretNonce++)), GalacticTrust.EvidenceTier.R2
         );
+    }
+
+    /// @dev The search a submitter is expected to run: try candidate secrets until the
+    /// commitment lands in the field. About one in five passes, so the bound is generous.
+    function _findProvableSecret(address who) internal view returns (bytes32) {
+        for (uint256 i = 0; i < 256; ++i) {
+            bytes32 candidate = keccak256(abi.encode("provable-secret", who, i));
+            if (verifier.isSecretProvable(who, candidate)) return candidate;
+        }
+        revert("no provable secret in 256 candidates");
     }
 
     function _signTwo(bytes32 id) internal {

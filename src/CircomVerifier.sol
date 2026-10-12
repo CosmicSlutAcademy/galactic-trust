@@ -179,7 +179,43 @@ contract CircomVerifier is IVerifier, Groth16Verifier, Ownable {
         return _inField(evidenceHash);
     }
 
+    /// @notice The content hash that `(submitter, secret)` commits to, in the exact form
+    /// `GalacticTrust` checks a reveal against. Exposed so an integrator can search for a
+    /// secret whose commitment is provable without reproducing the formula by hand.
+    ///
+    /// @dev This must stay byte-identical to `GalacticTrust.checkSecret` and
+    /// `GalacticTrust.revealSecret`, which both test a candidate with
+    /// `keccak256(abi.encode(candidate, submitter))`. Note the order: `(secret, submitter)`,
+    /// not the other way around. A test drives a real reveal through `GalacticTrust` and
+    /// asserts this helper produced the hash that reveal accepted, so the two cannot drift
+    /// apart silently.
+    function contentCommitment(address submitter, bytes32 secret) external pure returns (bytes32) {
+        return _commitment(submitter, secret);
+    }
+
+    /// @notice Whether a `(submitter, secret)` pair commits to an evidence hash the proof
+    /// system can answer about at all — the check to make BEFORE calling
+    /// `submitAttestation`, since `contentHash` is fixed by the secret.
+    ///
+    /// About one secret in five satisfies this, because the field is ~254 bits and a `bytes32`
+    /// is 256, so searching a few candidates is cheap and normal. It exists so an integrator
+    /// never has to know the field prime or reproduce the commitment formula.
+    ///
+    /// A secret this rejects is not a loss: the verdict just stays UNRESOLVED and the
+    /// attestation routes to the curator panel instead of minting. But a claim that was meant
+    /// to be machine-checkable would silently never become so, and this is the cheap place to
+    /// find that out.
+    function isSecretProvable(address submitter, bytes32 secret) external pure returns (bool) {
+        return _inField(_commitment(submitter, secret));
+    }
+
     // --- internals ------------------------------------------------------------------
+
+    /// @dev The commit-reveal formula, in one place so the two external views cannot disagree.
+    /// Must match `GalacticTrust.checkSecret` / `revealSecret`.
+    function _commitment(address submitter, bytes32 secret) private pure returns (bytes32) {
+        return keccak256(abi.encode(secret, submitter));
+    }
 
     function _slot(bytes32 evidenceHash, uint8 tier) private pure returns (bytes32) {
         return keccak256(abi.encode(evidenceHash, tier));

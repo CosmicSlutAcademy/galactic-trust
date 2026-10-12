@@ -1,10 +1,10 @@
 # SESSION STATE — Galactic-Trust (GLT) / GCIA epistemic ledger
 > Re-read this file first every time you resume. This is the single source of truth for GLT.
 
-**Last updated:** 2026-10-08
+**Last updated:** 2026-10-12
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
 **Location:** `~/galactic-trust` (1,214 src / 4,955 test lines Solidity + one circom circuit)
-**Status:** 164/164 tests green on both profiles (default ~8 s; `deep` = 5 fuzz suites at
+**Status:** 166/166 tests green on both profiles (default ~5 s; `deep` = 5 fuzz suites at
 2000 runs + 10 invariants at 128,000 calls each = 200 s), deploy script exercised against
 Anvil, a real Groth16 verifier built and tested against genuine proofs, NOT deployed to a
 public network, NOT audited.
@@ -27,7 +27,7 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 |---|---|
 | Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **use the absolute path in scripts, see §3** |
 | `GalacticTrust.sol` | ✅ compiles, quorum attestation + challenge window + slashing |
-| Test suite | ✅ 156/156 passing (83 unit + 33 adversarial + 8 expiry + 5 fuzz + 10 invariant + 25 verifier) |
+| Test suite | ✅ 166/166 passing (83 unit + 33 adversarial + 8 expiry + 5 fuzz + 10 invariant + 27 verifier) |
 | Tri-state evidence gate | ✅ `CONFIRMED`/`REFUTED`/`UNRESOLVED`, enforced at finalize |
 | Verifier outage failsafe | ✅ a reverting verifier → `UNRESOLVED`, never a protocol halt |
 | Curator quorum snapshot | ✅ snapshotted at submission, owner cannot move it mid-dispute |
@@ -42,7 +42,7 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 | Contract size within EIP-170 | ✅ 23,169 B — 1,407 B margin |
 | **Real ZK verifier** | ✅ **BUILT — `circuit/evidence.circom` + `src/CircomVerifier.sol`, Groth16, 25 tests on real proofs. NOT wired into any deployment** |
 | **Verifier trust boundary** | ✅ **device registry; `deviceKeyHash` bound to the signing key in-circuit — see §5** |
-| **Evidence-hash field check** | ⚠️ **`_inField` refuses out-of-field hashes. ~81% of random bytes32 are out of field — see §5** |
+| **Evidence-hash field check** | ⚠️ **`_inField` refuses out-of-field hashes. ~81% of random bytes32 are out of field — see §5. Integrator helpers `contentCommitment` / `isSecretProvable` added 2026-10-12 so a submitter can search for a provable secret** |
 | **Referral path** (`REFUTED`/`UNRESOLVED` → panel → `panelOverride`) | ✅ **now exercised — 3 bugs found and fixed, see §5** |
 | **Panel cannot be re-opened after ruling** | ✅ `panelSettled` — a ruling is final |
 | **`panelOverride` requires a strict reject majority** | ✅ silence and ties no longer grant approval |
@@ -945,15 +945,20 @@ Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4
    is for. The verifier is a separate 3,618 B contract and cost the token nothing. If a future
    change overruns, take `optimizer_runs` 20 → 1 (buys 47 B for ~1.6% gas, measured) or cut
    surface before raising the bar.
-5. ☐ **Decide whether the ~81% out-of-field hash rate is acceptable** (new, 2026-10-07). Not a
-   bug — refusing out-of-field hashes is required for soundness — but it means most submitters
-   will never get a machine verdict unless they pick an in-field `contentHash`. Options, in
-   order of preference: require submitters to pass `isProvable(hash)` before submitting;
-   constrain `contentHash` at submission time in GLT (costs EIP-170 bytes in the token, which
-   is currently scarcer than they seem); or accept that only device-attested evidence is ever
-   machine-checked, which is arguably the honest scope anyway. **Do not fix this by reducing
-   the hash modulo the field** — that reintroduces the cross-attestation collision the check
-   exists to prevent.
+5. ◑ **Out-of-field hash rate — integrator half CLOSED 2026-10-12.** Not a bug: refusing
+   out-of-field hashes is required for soundness (reduce the hash and it collides with
+   `hash - SNARK_FIELD`). But ~81% of `keccak256` outputs are above the prime, so a submitter
+   who picks `contentHash` without checking silently never gets a machine verdict. The chosen
+   option is the least invasive one: rather than spend EIP-170 margin constraining
+   `contentHash` in the token, `CircomVerifier` now exposes `contentCommitment(submitter,
+   secret)` and `isSecretProvable(submitter, secret)` for integrators to search for a provable
+   secret **before** calling `submitAttestation`. Two tests added (25 → 27 in
+   `CircomVerifier.t.sol`), including one that drives a real `checkSecret`/`revealSecret`
+   through `GalacticTrust` so the helper cannot drift from the contract's own formula —
+   verified red by corrupting the argument order. `CircomVerifier` 3,618 → 3,816 B; the token
+   is untouched at 23,169 B / 1,407 B margin. **Still open:** whether to *require* it at the
+   token boundary (costs margin) or accept that only device-attested evidence is ever
+   machine-checked, for the audit/deployment conversation.
 6. ☐ **Legal wrapper** (Wyoming DAO LLC) if this is ever to hold real money. Nothing here is
    legally binding; §2 records why that is not a Solidity problem at all.
 7. ✅ **Stranded stake — CLOSED 2026-10-08.** An `UNRESOLVED` attestation whose panel tied or

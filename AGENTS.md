@@ -2,7 +2,7 @@
 
 Foundry 1.5.1 / Solidity 0.8.33 / OpenZeppelin 5.7.0. Single contract, escrow-heavy, un-audited.
 
-**Read `SESSION.md` before changing anything.** It is 775 lines and is the real source of
+**Read `SESSION.md` before changing anything.** It is the real source of
 truth: §2 design decisions that must not be relitigated, §4 the contract surface, §5 every
 fund-loss bug this project has already shipped and fixed, §6 the ordered next actions.
 §5 in particular is the map to hand an auditor.
@@ -11,7 +11,7 @@ fund-loss bug this project has already shipped and fixed, §6 the ordered next a
 
 ```bash
 cd ~/galactic-trust
-/home/alexa/.foundry/bin/forge test                        # 164/164, ~8 s
+/home/alexa/.foundry/bin/forge test                        # 166/166, ~5 s
 FOUNDRY_PROFILE=deep /home/alexa/.foundry/bin/forge test   # ~200 s, pre-ship
 /home/alexa/.foundry/bin/forge build --sizes               # MUST stay under 24,576 B
 ```
@@ -26,7 +26,7 @@ that were never build failures.
 Current size: 23,169 B, **1,407 B of margin**. Roughly one and a half small features. Run
 `--sizes` on every change and report the delta.
 
-`CircomVerifier` is a **separate contract** (3,573 B). Anything implementing `IVerifier`
+`CircomVerifier` is a **separate contract** (3,816 B). Anything implementing `IVerifier`
 should be too — that is how the proof system was added at zero cost to the token's margin.
 
 ## What this contract is
@@ -172,7 +172,7 @@ circuit/genproofs.js      regenerates test/fixtures/proofs.json (real signatures
 test/GalacticTrust.t.sol  83 unit tests, lifecycle + governance
 test/Adversarial.t.sol    33 tests: hostile owner, broken verifier, ties, no-challenger
 test/Expiry.t.sol          8 tests: the EXPIRED terminal state and stake release
-test/CircomVerifier.t.sol 25 tests against real Groth16 proofs
+test/CircomVerifier.t.sol 27 tests against real Groth16 proofs
 test/Fuzz.t.sol            5 fuzz suites: conservation + terminality
 test/Invariant.t.sol      10 stateful invariants over a 17-operation handler
 script/Deploy.s.sol       Deploy + read-only Verify
