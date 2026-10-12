@@ -261,8 +261,17 @@ The deploy script cannot appoint the committee. `registerCurator` and `registerA
 
 ```bash
 export PRIVATE_KEY=... TREASURY=... INITIAL_SUPPLY=...
-forge script script/Deploy.s.sol:Deploy --rpc-url <url> --broadcast
+forge script script/Deploy.s.sol:Deploy --rpc-url <url> --broadcast \
+  --gas-estimate-multiplier 900
 ```
+
+`--gas-estimate-multiplier 900` is **required on a live network, not optional.** Foundry's
+local EVM underprices contract *code deposit* by ~6.8× relative to the live chain (measured on
+Sepolia 2026-10-12: `TimelockController` 1,567,751 local vs 10,622,345 on-chain; `GalacticTrust`
+5,504,475 vs 37,973,435). Without it each `CREATE` is sized at the local estimate, runs
+out-of-gas, and `forge script` reports only `Transaction Failure`. Over-provisioning a tx gas
+*limit* is free — only `gasUsed` is charged and the rest is refunded — so size it generously.
+The `deep`/Anvil gas numbers are not a budget for a live chain.
 
 Then, through the timelock:
 

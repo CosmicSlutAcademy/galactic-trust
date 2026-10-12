@@ -47,7 +47,7 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 | **Panel cannot be re-opened after ruling** | ✅ `panelSettled` — a ruling is final |
 | **`panelOverride` requires a strict reject majority** | ✅ silence and ties no longer grant approval |
 | Deactivation rejects unknown addresses | ✅ `NotAttester`/`NotCurator`, idempotent for real ones |
-| Deploy script | ✅ **exercised end-to-end on Anvil — 2 bugs found, see §5** |
+| Deploy script | ✅ **exercised end-to-end on Anvil and on Sepolia (2026-10-12) — 2 bugs found on Anvil; a 6.8× gas-underestimate on the live chain, see §5** |
 | Post-deploy verification | ✅ `Deploy.s.sol:Verify`, 8 read-only assertions |
 | README | ✅ real front page, states plainly that GLT asserts *stakes*, never truth |
 | Attester bonds + attester slashing | ✅ built and tested |
@@ -56,8 +56,8 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 | Bounded settlement loops | ✅ `MAX_SIGNERS`/`MAX_CHALLENGERS`/`MAX_CURATORS` caps + pull payments |
 | Access-gating / query fees (pillar 2) | ❌ not built — separate contract |
 | Audit | ❌ none |
-| Git remote | ✅ `origin` → `CosmicSlutAcademy/galactic-trust`, **3 commits unpushed** |
-| Mainnet/testnet deploy | ❌ none |
+| Git remote | ✅ `origin` → `CosmicSlutAcademy/galactic-trust`, in sync with `origin/main` |
+| Mainnet/testnet deploy | ⚠️ **Sepolia deployed 2026-10-12** — GLT `0x6f6c…`, timelock `0xC9d7…`, panel live + bonded, `Verify` green. No mainnet deploy |
 
 ---
 
@@ -629,6 +629,48 @@ Testing `Deploy.s.sol` against Anvil found two things that reading it could not.
 - **`vm.envUint` reverts on a missing key.** Any run command predating `TIMELOCK_DELAY` failed
   on a variable the script no longer needed. `vm.envOr` with a stated default is correct here.
 
+### The live-chain gas lesson (2026-10-12)
+
+The Sepolia deploy that closed §6.3 did confirm the gas costs, and they are **~6.8× the local
+numbers** — because Foundry 1.5.1's bundled EVM prices contract *code deposit* far below what
+the live network charges.
+
+| contract | Anvil / `forge` estimate | real Sepolia `gasUsed` | ratio |
+|---|---|---|---|
+| `TimelockController` | 1,567,751 | **10,622,345** | 6.78× |
+| `GalacticTrust` | 5,504,475 | **37,973,435** | 6.90× |
+
+Every plain `--broadcast` attempt failed with `Transaction Failure`: the receipt read
+`status 0`, `gasUsed == gasLimit` — out-of-gas at exactly the limit forge chose. That limit is
+`estimate × gas_estimate_multiplier/100` (default 130), and the estimate comes from forge's own
+simulation against revm, which is the number that is ~6.8× too low here. Two independent
+tracers and a second node confirmed the on-chain OOG; a *fork* of Sepolia reproduced the cheap
+number, so it is not chain state — Anvil and the live network simply disagree on the schedule.
+
+Root cause, isolated with two trivial creations via `cast send --create`:
+
+- a 6,000-byte zero runtime → **9,389,453** actual (≈1.27M expected);
+- a 16-byte runtime → **232,376** actual (≈58k expected);
+- marginal `(9,389,453 − 232,376) / (6000 − 16)` ≈ **1,530 gas per deployed byte**, against the
+  canonical 200/byte, plus a fixed ≈170k overhead.
+
+Control flow and output size are identical either way: the same constructor emits the same
+4 `RoleGranted` + `MinDelayChange` events, and the deployed bytes are exactly 6,360 on both
+(`cast code` matches the artifact's `deployedBytecode`). The divergence is in how the live
+chain prices those output bytes, not in what the contract does. Same stale-EVM class as the
+`PUSH0` / `evm_version` traps, except it fails at *broadcast* rather than at compile.
+
+The fix is at the call site, not in the contract: **`forge script … --broadcast
+--gas-estimate-multiplier 900`.** Over-provisioning a tx limit is free — only `gasUsed` is
+charged and the remainder is refunded — so a large multiplier costs nothing, provided it stays
+under the block gas limit (199.6M on this Sepolia). With it, `Deploy` succeeded: deploy txs
+`0xa8c0ced5…` (timelock) and `0x0ce8ee5a…` (GLT), 48,595,780 gas total.
+
+**Consequence for the README runbook:** the documented `forge script --broadcast` line, exactly
+as written, cannot deploy this project to a live network. It needs the multiplier (or explicit
+gas sizing). A documentation bug with a one-flag fix — but it is the reason no prior run ever
+showed a real gas number.
+
 ### The 47-green-tests trap (2026-09-30)
 
 The suite was 47/47 and still shipped four fund-loss bugs, because every test exercised
@@ -912,7 +954,8 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
 
 Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4 (README),
 5 (deploy script on Anvil), 8 (verifier in the fixture), **2 (circom verifier — closed
-2026-10-07)**, plus the curator bond and size reclamation from 2026-10-02. What remains:
+2026-10-07)**, **3 (testnet deploy + `Verify` — closed 2026-10-12)**, plus the curator bond and
+size reclamation from 2026-10-02. What remains:
 
 1. ☐ **External audit before any mainnet deploy with real value.** This is now the *only*
    engineering item left that gates shipping, and it is not optional. An unaudited contract
@@ -938,8 +981,26 @@ Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4
    trust boundary". **It is not set on any deployment**, so `verifier` remains `address(0)` and
    every verdict is still `CONFIRMED` in practice; wiring it up is a deployment decision, not
    an engineering one, and it belongs in the audit conversation.
-3. ☐ **Testnet deploy**, then `Verify` against it. Anvil confirmed the mechanics and surfaced
-   two script bugs; a testnet will confirm the gas costs, which no local run has.
+3. ✅ **Testnet deploy — CLOSED 2026-10-12.** Deployed to Sepolia (chain 11155111) and brought
+   the panel up; `Verify` reports **"all post-deploy checks passed"**. Deployer = treasury = the
+   throwaway key, so the same account holds the initial supply and can self-fund the curator
+   bond. `TIMELOCK_DELAY=60` (not the 2-day default) so the bring-up fit in one session, and
+   `VERIFIER=0x0` (every verdict `CONFIRMED`) — both are mechanics choices for this run, not
+   governance config.
+   - **GLT** `0x6f6cc577bF783F03d36112Da26B136d42a174Cec` (deploy tx `0x0ce8ee5a…`)
+   - **TimelockController** `0xC9d7C7C1F38844f492695354CC64D42D394b8F2D` (deploy tx `0xa8c0ced5…`)
+   - Bring-up through the timelock: `schedule` `registerCurator(burner, 1)` (`0xfafcc0e6…`),
+     wait 60 s, `execute` (`0x42b64e72…`), then `fundCuratorBond(1000e18)` (`0xfd972294…`).
+     `totalCuratorWeight = 1`, `curator bond funded = 1000e18`, held == owed.
+   - **What it confirmed:** the `onlyOwner`-through-timelock path, the curator-bond gate, and
+     `Verify`'s eight assertions all behave on a real chain exactly as Anvil predicted.
+   - **What it broke:** the gas costs it exists to confirm are **~6.8× the local numbers**
+     (`TimelockController` 10,622,345, `GalacticTrust` 37,973,435). The plain `--broadcast`
+     runbook fails; `--gas-estimate-multiplier 900` fixes it. See §5 "The live-chain gas lesson
+     (2026-10-12)".
+
+   *Original entry, kept:* Anvil confirmed the mechanics and surfaced two script bugs; a testnet
+   will confirm the gas costs, which no local run has.
 4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,407 B**, down from
    1,757 B: the 2026-10-08 audit sweep spent 201 B on two fund-loss fixes, which is what margin
    is for. The verifier is a separate 3,618 B contract and cost the token nothing. If a future
