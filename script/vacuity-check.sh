@@ -117,22 +117,28 @@ revert "sub-quorum acquittal of a refutation falls through to no-override" \
 
 echo "E. the EXPIRED terminal state -- removing the release re-strands the stake"
 revert "no release, so an unfinalizable attestation stays PENDING" \
-'if (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride) {
-att.status = AttestationStatus.EXPIRED;
-if (att.stake > 0) {
-totalStaked -= att.stake;
-_update(address(this), att.submitter, att.stake);' \
-'if (verdict == EvidenceVerdict.CONFIRMED && !att.panelOverride) {
-att.status = AttestationStatus.EXPIRED;
-if (att.stake > 0) {
-totalStaked -= att.stake;
-_update(address(this), att.submitter, att.stake);' \
+'att.attestationWeight < att.quorumWeight || (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride)' \
+'verdict == EvidenceVerdict.CONFIRMED && !att.panelOverride' \
 'Expiry|TiedPanel|Unattended|BrokenVerifier|SubQuorumPanel|testFuzz_ExpiryAlwaysTerminates'
 
 restore
 echo
-echo "F. control -- every fix in place:"
+echo "F. panelOverride set without attester quorum"
+revert "a quorum-free panel records an override on an attestation that cannot finalize" \
+'&& rejectWeight[id] > upholdWeight[id] && att.attestationWeight >= att.quorumWeight' \
+'&& rejectWeight[id] > upholdWeight[id]' \
+'PanelOverrideWithoutAttesterQuorum|testFuzz_ExpiryAlwaysTerminates'
+
+echo "G. the quorum release in _resolve -- removing it re-strands an under-quorum CONFIRMED attestation"
+revert "no stake release for an attestation with no attester quorum" \
+'att.attestationWeight < att.quorumWeight || (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride)' \
+'(verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride)' \
+'UnderQuorumConfirmedAttestation'
+
+restore
+echo
+echo "H. control -- every fix in place:"
 $FORGE test --match-path test/Expiry.t.sol 2>&1 | grep -E 'Suite result'
 $FORGE test --match-test 'testFuzz_ExpiryAlwaysTerminates' 2>&1 | grep -E 'Suite result'
 $FORGE test --match-path test/Adversarial.t.sol 2>&1 | grep -E 'Suite result'
-echo "G. source restored: $(cmp -s "$SRC" "$FIXED" && echo yes || echo NO)"
+echo "I. source restored: $(cmp -s "$SRC" "$FIXED" && echo yes || echo NO)"

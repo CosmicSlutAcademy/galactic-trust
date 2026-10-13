@@ -711,34 +711,40 @@ contract GalacticTrust is ERC20, ERC20Permit, ERC20Votes, Ownable2Step, Reentran
             // that showed up, not a panel that ruled: on a REFUTED verdict one curator holding
             // 100 against a 150 quorum acquitting at expiry opened the mint gate permanently
             // on a refutation nothing had overturned. Both conditions now hold together.
+            //
+            // Attester quorum is the third, and it is the same class of omission: the override
+            // only exists to make the attestation finalizable, and `finalizeAttestation` needs
+            // attester quorum as well as a permissive verdict. Recording it without quorum
+            // promised an exit that call refuses, while the challenge window was shut, the panel
+            // was settled, and expiry refused a resolved panel — so the stake was stranded. A
+            // panel can only overrule the machine on an attestation the attesters certified.
             // Read once. The verifier is external, so two reads is two calls to something that
             // could in principle answer differently, and the override decision and the release
             // below must agree on the same verdict.
             EvidenceVerdict verdict = _verdict(att);
             if (
                 verdict != EvidenceVerdict.CONFIRMED && upholdWeight[id] + rejectWeight[id] >= att.curatorQuorumWeight
-                    && rejectWeight[id] > upholdWeight[id]
+                    && rejectWeight[id] > upholdWeight[id] && att.attestationWeight >= att.quorumWeight
             ) {
                 att.panelOverride = true;
             }
-            // Reachable only from `expireReview`: `tallyDispute` reaches quorum and refuses a
-            // tie, so on that path either the verdict is CONFIRMED or the override is set, and
-            // either way the attestation can still finalize. Here it can be neither — a
-            // non-CONFIRMED verdict with no override the panel could reach.
+            // There is no exit left unless the attestation can actually finalize, which needs a
+            // permissive verdict *and* attester quorum. Either it is non-CONFIRMED with no
+            // override the panel could reach, or it never reached the attester quorum
+            // `finalizeAttestation` requires. In both cases the challenge window is absolute and
+            // shut, `panelSettled` refuses another ballot, no verdict can change without the owner
+            // replacing the verifier, and expiry refuses a panel that ruled — so the stake is
+            // stranded.
             //
-            // That combination used to strand the submitter's stake with no exit at all. The
-            // challenge window is absolute and shut, `panelSettled` refuses another ballot, no
-            // verdict can change without the owner replacing the verifier, and `expireReview`
-            // again is a no-op because `curatorVoters` is empty. Under a reverting verifier every
-            // attestation lands here, so an outage stranded a stake per submission.
-            //
-            // The settlement is the only one consistent with this function's own rule that an
-            // unreachable panel cannot punish a submitter who did nothing wrong: the stake goes
-            // back and no reward is minted. The claim was neither certified nor refuted, so it
-            // earns nothing and costs nothing. Minting here would be a third route to supply on
-            // evidence the gate refused to confirm, which is the thing the tri-state gate exists
-            // to prevent.
-            if (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride) {
+            // The first case is the 2026-10-08 fix; the quorum case shares its root and its
+            // settlement. An unreachable panel cannot punish a submitter who did nothing wrong:
+            // the stake goes back and no reward is minted. The claim was neither certified nor
+            // refuted, so it earns nothing and costs nothing. Minting here would be a third route
+            // to supply on evidence the gate refused to confirm, which is the thing the tri-state
+            // gate exists to prevent.
+            if (
+                att.attestationWeight < att.quorumWeight || (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride)
+            ) {
                 att.status = AttestationStatus.EXPIRED;
                 if (att.stake > 0) {
                     totalStaked -= att.stake;

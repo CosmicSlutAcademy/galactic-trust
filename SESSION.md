@@ -3,8 +3,8 @@
 
 **Last updated:** 2026-10-12
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
-**Location:** `~/galactic-trust` (1,214 src / 4,955 test lines Solidity + one circom circuit)
-**Status:** 166/166 tests green on both profiles (default ~5 s; `deep` = 5 fuzz suites at
+**Location:** `~/galactic-trust` (1,007 src lines Solidity + tests + one circom circuit)
+**Status:** 168/168 tests green on both profiles (default ~5 s; `deep` = 5 fuzz suites at
 2000 runs + 10 invariants at 128,000 calls each = 200 s), deploy script exercised against
 Anvil, a real Groth16 verifier built and tested against genuine proofs, NOT deployed to a
 public network, NOT audited.
@@ -27,7 +27,7 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 |---|---|
 | Foundry toolchain | ✅ installed at `~/.foundry/bin` (forge 1.5.1) — **use the absolute path in scripts, see §3** |
 | `GalacticTrust.sol` | ✅ compiles, quorum attestation + challenge window + slashing |
-| Test suite | ✅ 166/166 passing (83 unit + 33 adversarial + 8 expiry + 5 fuzz + 10 invariant + 27 verifier) |
+| Test suite | ✅ 168/168 passing (83 unit + 35 adversarial + 8 expiry + 5 fuzz + 10 invariant + 27 verifier) |
 | Tri-state evidence gate | ✅ `CONFIRMED`/`REFUTED`/`UNRESOLVED`, enforced at finalize |
 | Verifier outage failsafe | ✅ a reverting verifier → `UNRESOLVED`, never a protocol halt |
 | Curator quorum snapshot | ✅ snapshotted at submission, owner cannot move it mid-dispute |
@@ -39,7 +39,7 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 | Escrow solvency invariant | ✅ `totalLiabilities()` accounted on every movement |
 | Owner burn limited to unbacked balance | ✅ `recoverExcessStake` cannot touch live escrow |
 | Challenge bond locked while challenge open | ✅ `lockedChallengeBond` |
-| Contract size within EIP-170 | ✅ 23,169 B — 1,407 B margin |
+| Contract size within EIP-170 | ✅ 23,234 B — 1,342 B margin |
 | **Real ZK verifier** | ✅ **BUILT — `circuit/evidence.circom` + `src/CircomVerifier.sol`, Groth16, 25 tests on real proofs. NOT wired into any deployment** |
 | **Verifier trust boundary** | ✅ **device registry; `deviceKeyHash` bound to the signing key in-circuit — see §5** |
 | **Evidence-hash field check** | ⚠️ **`_inField` refuses out-of-field hashes. ~81% of random bytes32 are out of field — see §5. Integrator helpers `contentCommitment` / `isSecretProvable` added 2026-10-12 so a submitter can search for a provable secret** |
@@ -185,7 +185,7 @@ Pinned versions this was built and tested against:
 
 ```
 test/GalacticTrust.t.sol    83 unit tests, lifecycle + governance
-test/Adversarial.t.sol      27 tests, hostile owner / broken verifier / tie / no-challenger
+test/Adversarial.t.sol      35 tests, hostile owner / broken verifier / tie / no-challenger / quorum terminality
 test/Fuzz.t.sol              5 fuzz suites, conservation + terminality + curator slash
 test/Invariant.t.sol        10 stateful invariants over a 17-operation handler
 ```
@@ -299,7 +299,7 @@ submitAttestation()  → PENDING, stake locked in contract, 2-day window opens
 - Owner is expected to be a `TimelockController` with `admin = address(0)`.
 - `Ownable2Step` — `transferOwnership` alone leaves one key in control until accepted.
 
-### Contract surface (`src/GalacticTrust.sol`, 939 lines)
+### Contract surface (`src/GalacticTrust.sol`, 1,007 lines)
 
 | Function | Line | Role |
 |---|---|---|
@@ -604,6 +604,64 @@ Two lessons worth keeping, both about the check itself:
 - **Reverting in the wrong direction proves nothing either.** One revert removed the whole
   `expireReview` condition, making the contract *stricter* than the bug, and the tests accepted
   it. Green there is not a weak property; it is not the bug being tested.
+
+### The attester-quorum terminality gap (2026-10-12)
+
+The 2026-10-08 `EXPIRED` fix closed the non-`CONFIRMED` half of "a `PENDING` attestation with no
+exit, holding `minStake` forever". It left the **attester-quorum** half open, and that half
+stayed invisible for the same reason §5 keeps recording: the property guarding it was vacuous.
+
+`finalizeAttestation` gates on *two* things: a permissive verdict (`CONFIRMED`, or a panel
+`panelOverride`) **and** `att.attestationWeight >= att.quorumWeight`. Finding 3 only reasoned
+about the first. Its own justification — "on the `tallyDispute` path either the verdict is
+`CONFIRMED` or the override is set and the attestation can still finalize" — is silently a
+statement about a *zero* quorum, because the fuzz fixture it was verified against **registers no
+attesters**, so `quorumWeight` was always `0`. Giving that fixture three attesters and signing a
+fuzzed 0–3 of them is what turns the property red on the old code.
+
+The bug, concretely. A panel reaches quorum and rejects by a strict majority, so `_resolve`
+records `panelOverride` — but the attestation never reached attester quorum. Every exit is then
+shut at once:
+
+- `finalizeAttestation` reverts `QuorumNotReached`;
+- `expireReview` reverts `ReviewAlreadyResolved` (the panel "already resolved" it);
+- `castCuratorVote` reverts `AlreadyRuled` (`panelSettled`);
+- `challengeAttestation` reverts `ChallengeWindowClosed`;
+- `signAttestation` is the only door left, and only while an eligible, bonded attester exists.
+
+So the stake is not stranded at the moment of the ruling — it is stranded the moment the attester
+set can no longer reach the snapshotted quorum: the owner deactivating attesters, or their bonds
+consumed by other disputes. `tallyDispute` runs as early as `challengeDeadline + 1`, so this is
+reachable in the ordinary course, and it is exactly the hostile-owner freeze
+`test_HostileOwnerCannotFreezeOrSteal` is meant to forbid. The identical gap strands a
+**`CONFIRMED`** verdict: nothing needed an override there, so nothing ever expired it.
+
+**The fix is one clause and one three-word condition, both in `_resolve`.** The override is now
+recorded only when `att.attestationWeight >= att.quorumWeight` — it means "this can finalize", so
+recording it without quorum promises an exit `finalizeAttestation` refuses. The release below now
+fires when the attestation cannot finalize for *either* reason:
+
+```solidity
+if (
+    att.attestationWeight < att.quorumWeight
+        || (verdict != EvidenceVerdict.CONFIRMED && !att.panelOverride)
+) {
+```
+
+The stake goes back and nothing is minted, exactly as finding 3 settled the verdict half.
+
+**Cost:** 65 B (23,169 → 23,234, margin 1,407 → 1,342); 166 → 168 tests. Two adversarial cases
+(`test_PanelOverrideWithoutAttesterQuorumExpiresInsteadOfStranding`,
+`test_UnderQuorumConfirmedAttestationExpiresInsteadOfStranding`) and the strengthened
+`testFuzz_ExpiryAlwaysTerminates`. Both new fixes are entries F and G in
+`script/vacuity-check.sh`, both go red when reverted, and the old entry E was retargeted onto the
+new condition it shares.
+
+**Lesson worth keeping:** finding 3 and this finding are the same bug read on two axes, and the
+property written to cover it was **green on the second axis** because its fixture could not build
+an under-quorum state. Before trusting `testFuzz_ExpiryAlwaysTerminates`, check that the fixture
+can actually reach "PENDING and not finalizable" — a terminality property is only as strong as
+the states its fixture can construct.
 
 ### The deploy-script lessons (2026-10-05)
 
@@ -964,9 +1022,9 @@ size reclamation from 2026-10-02. What remains:
    unusually good map of where to look, and the 2026-10-05 referral bugs are exactly the class
    an auditor would have charged most to find.
 
-   Specifically worth asking about: the `expireReview` default-reject path, whether
-   `panelOverride` + `panelSettled` can still be reached in a combination that deadlocks funds
-   (**it can — see §5 finding 3, which is known and unfixed**), whether the `ERC20Votes`
+   Specifically worth asking about: the `expireReview` default-reject path, whether any *other*
+   `panelOverride` + `panelSettled` combination can deadlock funds (the attester-quorum one is
+   closed as of 2026-10-12 — §5 "The attester-quorum terminality gap"), whether the `ERC20Votes`
    checkpoint machinery interacts badly with `_burn` during settlement, and whether any other
    settlement leg still reads an account aggregate where a per-record figure is owed. That last
    one is the 2026-10-08 forfeit bug, it survived 155 green tests and 10 green invariants, and
@@ -1001,11 +1059,11 @@ size reclamation from 2026-10-02. What remains:
 
    *Original entry, kept:* Anvil confirmed the mechanics and surfaced two script bugs; a testnet
    will confirm the gas costs, which no local run has.
-4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,407 B**, down from
-   1,757 B: the 2026-10-08 audit sweep spent 201 B on two fund-loss fixes, which is what margin
-   is for. The verifier is a separate 3,618 B contract and cost the token nothing. If a future
-   change overruns, take `optimizer_runs` 20 → 1 (buys 47 B for ~1.6% gas, measured) or cut
-   surface before raising the bar.
+4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,342 B** — the
+   2026-10-08 audit sweep spent 201 B and the 2026-10-12 attester-quorum fix 65 B on real
+   fund-loss fixes, which is what margin is for. The verifier is a separate 3,816 B contract and
+   cost the token nothing. If a future change overruns, take `optimizer_runs` 20 → 1 (buys 47 B
+   for ~1.6% gas, measured) or cut surface before raising the bar.
 5. ◑ **Out-of-field hash rate — integrator half CLOSED 2026-10-12.** Not a bug: refusing
    out-of-field hashes is required for soundness (reduce the hash and it collides with
    `hash - SNARK_FIELD`). But ~81% of `keccak256` outputs are above the prime, so a submitter
@@ -1016,21 +1074,25 @@ size reclamation from 2026-10-02. What remains:
    secret **before** calling `submitAttestation`. Two tests added (25 → 27 in
    `CircomVerifier.t.sol`), including one that drives a real `checkSecret`/`revealSecret`
    through `GalacticTrust` so the helper cannot drift from the contract's own formula —
-   verified red by corrupting the argument order. `CircomVerifier` 3,618 → 3,816 B; the token
-   is untouched at 23,169 B / 1,407 B margin. **Still open:** whether to *require* it at the
-   token boundary (costs margin) or accept that only device-attested evidence is ever
-   machine-checked, for the audit/deployment conversation.
+   verified red by corrupting the argument order. `CircomVerifier` 3,618 → 3,816 B; that change
+   did not touch the token. **DECIDED 2026-10-12:** the helper stays integrator-side rather than
+   required at the token boundary. Only device-attested evidence is ever machine-checked, and
+   requiring the check would couple the token to the Circom verifier and spend margin for a
+   precondition the caller can satisfy off-chain. Recorded for the audit.
 6. ☐ **Legal wrapper** (Wyoming DAO LLC) if this is ever to hold real money. Nothing here is
    legally binding; §2 records why that is not a Solidity problem at all.
-7. ✅ **Stranded stake — CLOSED 2026-10-08.** An `UNRESOLVED` attestation whose panel tied or
-   stayed silent at expiry used to hold `minStake` with no exit at all. The `EXPIRED` terminal
-   state now returns the stake and mints nothing. §5 "The audit-sweep findings" finding 3.
+7. ✅ **Stranded stake — CLOSED 2026-10-08, extended 2026-10-12.** An `UNRESOLVED` attestation
+   whose panel tied or stayed silent at expiry used to hold `minStake` with no exit at all. The
+   `EXPIRED` terminal state now returns the stake and mints nothing. §5 "The audit-sweep
+   findings" finding 3. **The attester-quorum half — a panel override, or a `CONFIRMED` verdict,
+   with no attester quorum behind it — was found and closed 2026-10-12; §5 "The attester-quorum
+   terminality gap".**
 ### Not on the list, deliberately
 
 - **Off-grid settlement.** §2 item 1. Physically impossible as specified; a store-and-forward
   design is salvageable but is a different project.
 - **Pillar 2, access-gating / query fees.** Unbuilt. Adding it now would spend scarce EIP-170
-  margin before an audit has said what the 1,407 B should be spent on.
+  margin before an audit has said what the 1,342 B should be spent on.
 - **Removing `secretRevealed` / `disputeUpheld` from the ABI.** Both have 0 external call sites
   but are meaningful public record — `secretRevealed` is what a consumer reads to know a
   pre-image was disclosed, and `disputeUpheld` is the ruling. Removing them to save bytes would

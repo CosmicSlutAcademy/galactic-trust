@@ -1095,6 +1095,74 @@ contract AdversarialTest is Test {
         assertEq(uint8(glt.getAttestation(id).status), uint8(GalacticTrust.AttestationStatus.FINALIZED));
         _solvent();
     }
+
+    // ---------- 2026-10-12: attester-quorum terminality ----------
+
+    /// A panel can only overrule the machine on an attestation the attesters actually certified.
+    /// The override exists to make an attestation finalizable, and finalization needs attester
+    /// quorum as well as a permissive verdict. Recording it without quorum promised an exit
+    /// `finalizeAttestation` refuses, while the challenge window was shut, the panel settled, and
+    /// expiry refused a resolved panel — so the stake was stranded, and with the attesters gone,
+    /// stranded for good.
+    ///
+    /// Found by re-reading the 2026-10-08 finding 3 against the attester-quorum axis its own
+    /// reasoning never exercised: the fuzz fixture registers no attesters, so `quorumWeight` was
+    /// always zero and "the override means the attestation can still finalize" was silently a
+    /// statement about a free quorum.
+    function test_PanelOverrideWithoutAttesterQuorumExpiresInsteadOfStranding() public {
+        v.setVerdict(EvidenceVerdict.UNRESOLVED);
+        bytes32 id = _submit(); // nobody signs: attestationWeight 0 < quorumWeight 100
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        // Curators reach quorum (200 >= 150) with a strict reject majority.
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        uint256 before = glt.balanceOf(submitter);
+        glt.tallyDispute(id);
+
+        // No override: without attester quorum it would promise a finalization that cannot happen.
+        assertFalse(glt.getAttestation(id).panelOverride, "no override without attester quorum");
+        // Instead of a PENDING record holding the stake forever, the attestation terminates.
+        assertEq(
+            uint8(glt.getAttestation(id).status),
+            uint8(GalacticTrust.AttestationStatus.EXPIRED),
+            "an unfinalizable attestation expires rather than stranding the stake"
+        );
+        assertEq(glt.getAttestation(id).stake, 0, "the record no longer reports a live stake");
+        assertEq(glt.balanceOf(submitter), before + MIN_STAKE, "the stake went back to the submitter");
+        _solvent();
+    }
+
+    /// The same root with no verdict gate: a CONFIRMED attestation — the tri-state gate's own
+    /// default, and every attestation on a `verifier == address(0)` deployment — that never
+    /// reached attester quorum used to sit PENDING forever. Nothing expires a CONFIRMED verdict
+    /// and finalization still needs the quorum, so the stake was stranded exactly as above.
+    function test_UnderQuorumConfirmedAttestationExpiresInsteadOfStranding() public {
+        // setUp's verifier answers CONFIRMED.
+        bytes32 id = _submit(); // nobody signs: 0 < 100
+        vm.prank(challenger1);
+        glt.challengeAttestation(id, "a");
+        _skipWindow();
+
+        vm.prank(curator1);
+        glt.castCuratorVote(id, false);
+        vm.prank(curator2);
+        glt.castCuratorVote(id, false);
+        uint256 before = glt.balanceOf(submitter);
+        glt.tallyDispute(id);
+
+        assertEq(
+            uint8(glt.getAttestation(id).status),
+            uint8(GalacticTrust.AttestationStatus.EXPIRED),
+            "a CONFIRMED attestation with no attester quorum also expires"
+        );
+        assertEq(glt.balanceOf(submitter), before + MIN_STAKE, "the stake went back to the submitter");
+        _solvent();
+    }
 }
 
 contract MockV is IVerifier {

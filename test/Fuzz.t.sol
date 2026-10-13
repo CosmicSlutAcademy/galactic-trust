@@ -177,10 +177,26 @@ contract FuzzTest is Test {
     /// The verdict is fuzzed now, and a post-expiry `PENDING` has to prove it can still reach
     /// `FINALIZED`. The precondition reads `evidenceVerdict` and `panelOverride`, which are
     /// exactly the two things `finalizeAttestation` gates on — not a different source of truth.
-    function testFuzz_ExpiryAlwaysTerminates(uint8 pattern, uint8 verdictSeed) public {
+    function testFuzz_ExpiryAlwaysTerminates(uint8 pattern, uint8 verdictSeed, uint8 signerSeed) public {
         vm.prank(owner);
         glt.setChallengeBondAmount(10e18);
         glt.setAttesterBondAmount(10e18);
+
+        // Attesters, so quorum is non-zero. The old fixture registered none, which made
+        // `quorumWeight` zero and left this property silent on the axis the quorum strand lives
+        // on: "a PENDING attestation can still be finalized" was vacuously true because a quorum
+        // of zero is free. That is the same class of vacuity §5 warns about, and it is why a
+        // stranded stake survived a green property.
+        address[] memory signers = new address[](3);
+        for (uint256 i = 0; i < 3; i++) {
+            signers[i] = makeAddr(string.concat("expSigner", vm.toString(i)));
+            vm.prank(owner);
+            glt.registerAttester(signers[i], 100);
+            vm.prank(submitter);
+            glt.transfer(signers[i], 20e18);
+            vm.prank(signers[i]);
+            glt.fundAttesterBond(10e18);
+        }
 
         FuzzV fv = new FuzzV(EvidenceVerdict.CONFIRMED);
         vm.prank(owner);
@@ -192,6 +208,14 @@ contract FuzzTest is Test {
         vm.prank(submitter);
         bytes32 id =
             glt.submitAttestation(keccak256(abi.encode(secret, submitter)), secret, GalacticTrust.EvidenceTier.R2);
+
+        // 0..3 signers against a 150 quorum (three attesters at weight 100), so quorum may or may
+        // not be met -- the half of the predicate the old fixture could never exercise.
+        uint256 nSign = _fuzzBound(signerSeed, 0, 3);
+        for (uint256 i = 0; i < nSign; i++) {
+            vm.prank(signers[i]);
+            glt.signAttestation(id);
+        }
 
         address c = makeAddr("cx");
         vm.prank(submitter);
@@ -231,11 +255,12 @@ contract FuzzTest is Test {
 
         GalacticTrust.AttestationStatus s = glt.getAttestation(id).status;
         if (s == GalacticTrust.AttestationStatus.PENDING) {
-            // Only legitimate if it can still be finalized. A PENDING attestation with a
-            // non-CONFIRMED verdict and no override has no exit left at all -- the challenge
-            // window is shut, the panel has ruled, and no expiry will change the verdict.
-            bool finalizable =
-                glt.evidenceVerdict(id) == EvidenceVerdict.CONFIRMED || glt.getAttestation(id).panelOverride;
+            // Only legitimate if it can still be finalized, and `finalizeAttestation` needs both
+            // a permissive verdict and attester quorum. Checking only the verdict half was green
+            // on a PENDING record whose stake was stranded; the quorum check is the other half.
+            GalacticTrust.Attestation memory a = glt.getAttestation(id);
+            bool finalizable = (glt.evidenceVerdict(id) == EvidenceVerdict.CONFIRMED || a.panelOverride)
+                && a.attestationWeight >= a.quorumWeight;
             assertTrue(
                 finalizable,
                 "a PENDING attestation after expiry can never be finalized: the submitter's stake is stranded"

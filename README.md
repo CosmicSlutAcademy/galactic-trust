@@ -43,7 +43,7 @@ Two consequences worth stating plainly:
 - What a `CONFIRMED` means is narrow: an *approved device key* signed a reading that fits its
   declared tier's numeric envelope. It does not mean the reading is true. See below.
 - The repository is at `~/galactic-trust`, built with Foundry 1.5.1, Solidity 0.8.33,
-  OpenZeppelin 5.7.0. 166 tests pass, including 10 stateful invariants over a 17-operation
+  OpenZeppelin 5.7.0. 168 tests pass, including 10 stateful invariants over a 17-operation
   handler.
 
 The three pillars of the original design could not be built as written, and the reasons are
@@ -177,7 +177,7 @@ Each of these exists because its absence was a bug that a green suite walked pas
   unspendable.
 - **A single challenger cannot freeze anything.** Challenges accumulate; escalation is a
   curator-quorum event, not one wallet's decision.
-- **The bytecode fits.** 23,169 B against the 24,576 B EIP-170 limit — 1,407 B of margin. The
+- **The bytecode fits.** 23,234 B against the 24,576 B EIP-170 limit — 1,342 B of margin. The
   optimizer was silently off at one point, leaving 38 KB of undeployable bytecode that a
   fully passing test suite was perfectly happy with. `forge build --sizes` is part of the build
   for that reason. The verifier is a **separate contract** (3,816 B), so adding a real proof
@@ -190,7 +190,7 @@ Each of these exists because its absence was a bug that a green suite walked pas
 
 ```bash
 cd ~/galactic-trust
-/home/alexa/.foundry/bin/forge test                        # 166/166, ~5 s
+/home/alexa/.foundry/bin/forge test                        # 168/168, ~5 s
 FOUNDRY_PROFILE=deep /home/alexa/.foundry/bin/forge test   # 5 fuzz at 2000 runs + 10 invariants at 128,000 calls each, ~160 s
 /home/alexa/.foundry/bin/forge build --sizes               # MUST stay under 24,576 B
 ```
@@ -242,7 +242,7 @@ circuit/evidence.circom       proves: approved device signed an in-envelope read
 circuit/build.sh              circuit -> keys -> Verifier.sol
 circuit/genproofs.js          regenerates the test fixtures (real signatures, real proofs)
 test/GalacticTrust.t.sol      83 unit tests, lifecycle and governance
-test/Adversarial.t.sol        27 tests: hostile owner, broken verifier, ties, no-challenger
+test/Adversarial.t.sol        35 tests: hostile owner, broken verifier, ties, no-challenger
 test/CircomVerifier.t.sol     27 tests against real Groth16 proofs
 test/Fuzz.t.sol               5 fuzz suites: conservation and terminality
 test/Invariant.t.sol         10 stateful invariants over a 17-operation handler
