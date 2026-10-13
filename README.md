@@ -249,10 +249,13 @@ test/Invariant.t.sol         10 stateful invariants over a 17-operation handler
 test/fixtures/proofs.json    committed proofs (regenerating them takes minutes)
 script/Deploy.s.sol          Deploy + read-only Verify
 SESSION.md                    the working log, including what has already gone wrong here
+AUDIT.md                      auditor hand-off brief: scope, bug history, questions, reproduce
+LEGAL.md                      legal-wrapper plan (not legal advice)
 ```
 
 `SESSION.md` §5 is a list of the bugs this project has already shipped and fixed. It is worth
-reading before touching the settlement code — and it is the map to hand an auditor.
+reading before touching the settlement code — and `AUDIT.md` is the brief built from it to hand
+an auditor.
 
 ## Bringing a deployment up
 

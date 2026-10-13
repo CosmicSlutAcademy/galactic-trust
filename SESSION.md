@@ -1,13 +1,15 @@
 # SESSION STATE — Galactic-Trust (GLT) / GCIA epistemic ledger
 > Re-read this file first every time you resume. This is the single source of truth for GLT.
 
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-13
 **Operator:** alexa @ Ubuntu 26.04.1 (WSL2)
 **Location:** `~/galactic-trust` (1,007 src lines Solidity + tests + one circom circuit)
 **Status:** 168/168 tests green on both profiles (default ~5 s; `deep` = 5 fuzz suites at
 2000 runs + 10 invariants at 128,000 calls each = 200 s), deploy script exercised against
-Anvil, a real Groth16 verifier built and tested against genuine proofs, NOT deployed to a
-public network, NOT audited.
+Anvil, a real Groth16 verifier built and tested against genuine proofs, deployed to **Sepolia
+testnet for mechanics only**, NOT deployed to mainnet, NOT audited. The two external gates —
+the audit engagement and legal formation — now have ready hand-off packages: `AUDIT.md`,
+`LEGAL.md`.
 
 **Read this first if you are resuming.** The referral path was never tested until
 2026-10-05, and finding out why produced three fund-loss bugs plus two properties that
@@ -55,7 +57,8 @@ toolchain lessons" — including one bug that made every valid proof read as rej
 | Weighted curator panel | ✅ built — `onlyOwner` ruling replaced |
 | Bounded settlement loops | ✅ `MAX_SIGNERS`/`MAX_CHALLENGERS`/`MAX_CURATORS` caps + pull payments |
 | Access-gating / query fees (pillar 2) | ❌ not built — separate contract |
-| Audit | ❌ none |
+| Audit | ⚠️ hand-off brief ready (`AUDIT.md`); engagement not started |
+| Legal wrapper | ⚠️ plan ready (`LEGAL.md`); formation not started |
 | Git remote | ✅ `origin` → `CosmicSlutAcademy/galactic-trust`, in sync with `origin/main` |
 | Mainnet/testnet deploy | ⚠️ **Sepolia deployed 2026-10-12** — GLT `0x6f6c…`, timelock `0xC9d7…`, panel live + bonded, `Verify` green. No mainnet deploy |
 
@@ -1012,15 +1015,18 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
 
 Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4 (README),
 5 (deploy script on Anvil), 8 (verifier in the fixture), **2 (circom verifier — closed
-2026-10-07)**, **3 (testnet deploy + `Verify` — closed 2026-10-12)**, plus the curator bond and
-size reclamation from 2026-10-02. What remains:
+2026-10-07)**, **3 (testnet deploy + `Verify` — closed 2026-10-12)**, **the auditor hand-off and
+legal-wrapper packages — closed 2026-10-13**, plus the curator bond and size reclamation from
+2026-10-02. Everything below is now closed or a standing check:
 
-1. ☐ **External audit before any mainnet deploy with real value.** This is now the *only*
-   engineering item left that gates shipping, and it is not optional. An unaudited contract
-   that mints a token people pay real money for is not a smaller version of this one, it is a
-   liability. Hand the auditor §5 as the list of what has already gone wrong here — it is an
-   unusually good map of where to look, and the 2026-10-05 referral bugs are exactly the class
-   an auditor would have charged most to find.
+1. ✅ **Auditor hand-off package — CLOSED 2026-10-13; the audit *engagement* is the one external
+   gate left.** `AUDIT.md` is the ready-to-send brief: subject and scope, the trust model, the
+   six failure-mode patterns, a dated table of every fund-loss bug found and fixed with the test
+   that guards it, the explicit questions below, the invariants to re-check, and how to
+   reproduce. It packages §5 rather than replacing it — §5 stays the long form. The audit itself
+   is not ours to complete; it is the *only* external item that gates a mainnet deploy with real
+   value, and an unaudited contract that mints a token people pay real money for is a liability,
+   not a smaller version of this one.
 
    Specifically worth asking about: the `expireReview` default-reject path, whether any *other*
    `panelOverride` + `panelSettled` combination can deadlock funds (the attester-quorum one is
@@ -1079,8 +1085,12 @@ size reclamation from 2026-10-02. What remains:
    required at the token boundary. Only device-attested evidence is ever machine-checked, and
    requiring the check would couple the token to the Circom verifier and spend margin for a
    precondition the caller can satisfy off-chain. Recorded for the audit.
-6. ☐ **Legal wrapper** (Wyoming DAO LLC) if this is ever to hold real money. Nothing here is
-   legally binding; §2 records why that is not a Solidity problem at all.
+6. ✅ **Legal-wrapper plan — CLOSED 2026-10-13.** `LEGAL.md` records why a wrapper is needed
+   (§2: nothing here is legally binding), what it must hold and govern (treasury, governor role,
+   members, arbitration), the candidate structures (Wyoming DAO LLC vs DUNA vs a plain LLC), the
+   open questions for counsel, and a decision checklist. It is explicitly **not legal advice**;
+   formation and a token-characterization memo need a real lawyer and stay the operator's
+   external action.
 7. ✅ **Stranded stake — CLOSED 2026-10-08, extended 2026-10-12.** An `UNRESOLVED` attestation
    whose panel tied or stayed silent at expiry used to hold `minStake` with no exit at all. The
    `EXPIRED` terminal state now returns the stake and mints nothing. §5 "The audit-sweep
@@ -1103,8 +1113,9 @@ size reclamation from 2026-10-02. What remains:
 ## 7. Reality check on priorities
 
 GLT is a real build with a defensible thesis, but it is **not** the thing with a clock on it.
-`~/bounty/SESSION.md` §3 has three unchecked bounty accounts, and identity verification (§3.2)
-takes **days to weeks**. That gates the whole income pipeline and gets no cheaper by waiting.
-GLT will be in exactly this state in a month either way.
+Its engineering queue is empty as of 2026-10-13; what remains is external — an audit engagement
+and legal formation, both prepared in `AUDIT.md` / `LEGAL.md`. `~/bounty/SESSION.md` §3 has
+three unchecked bounty accounts, and identity verification (§3.2) takes **days to weeks**. That
+gates the whole income pipeline and gets no cheaper by waiting.
 
-Sequence: do the accounts, then come back here.
+Sequence: do the accounts, then come back here for the audit and the wrapper.

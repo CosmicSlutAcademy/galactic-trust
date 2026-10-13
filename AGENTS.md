@@ -177,6 +177,8 @@ test/Fuzz.t.sol            5 fuzz suites: conservation + terminality
 test/Invariant.t.sol      10 stateful invariants over a 17-operation handler
 script/Deploy.s.sol       Deploy + read-only Verify
 SESSION.md                working log, including everything that has already gone wrong
+AUDIT.md                  auditor hand-off brief: scope, bug history, questions, reproduce
+LEGAL.md                  legal-wrapper plan (not legal advice)
 ```
 
 ## Deploy notes
