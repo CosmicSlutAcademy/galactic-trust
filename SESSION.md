@@ -965,6 +965,9 @@ a hostile owner, an exit mid-dispute. A green suite means the happy path works, 
     settlement-heavy tests: 200 → 23,125 B / 7,097,582 gas; 20 → 22,563 B / 7,130,001;
     1 → 22,516 B / 7,241,474; 999999 → 29,809 B and **-5,233 margin, i.e. undeployable.**
     20 takes ~95% of the size win for ~23% of the gas cost.
+    *(These are the 2026-10-02 bytes. Re-measured 2026-10-13 on the post-fix build — see
+    `foundry.toml`: the direction and the 47 B `20 → 1` delta are unchanged, the absolute
+    sizes are ~671 B higher.)*
   - **The old `foundry.toml` comment claimed high turns were pinned low because of "a large gas
     regression" on the settlement loops. That was wrong — the worst case is 2.03%, and 0.46%
     at the chosen setting.** The claim had been carried across sessions unverified and was
@@ -1017,7 +1020,7 @@ Closed so far: 1 (git remote), 2 (deactivation guards), 3 (invariant handler), 4
 5 (deploy script on Anvil), 8 (verifier in the fixture), **2 (circom verifier — closed
 2026-10-07)**, **3 (testnet deploy + `Verify` — closed 2026-10-12)**, **the auditor hand-off and
 legal-wrapper packages — closed 2026-10-13**, plus the curator bond and size reclamation from
-2026-10-02. Everything below is now closed or a standing check:
+2026-10-02. All items below are now closed; the one standing rule is the EIP-170 gate (item 4):
 
 1. ✅ **Auditor hand-off package — CLOSED 2026-10-13; the audit *engagement* is the one external
    gate left.** `AUDIT.md` is the ready-to-send brief: subject and scope, the trust model, the
@@ -1065,11 +1068,14 @@ legal-wrapper packages — closed 2026-10-13**, plus the curator bond and size r
 
    *Original entry, kept:* Anvil confirmed the mechanics and surfaced two script bugs; a testnet
    will confirm the gas costs, which no local run has.
-4. ☐ **Re-check EIP-170 margin before landing each of the above.** Now **1,342 B** — the
-   2026-10-08 audit sweep spent 201 B and the 2026-10-12 attester-quorum fix 65 B on real
-   fund-loss fixes, which is what margin is for. The verifier is a separate 3,816 B contract and
-   cost the token nothing. If a future change overruns, take `optimizer_runs` 20 → 1 (buys 47 B
-   for ~1.6% gas, measured) or cut surface before raising the bar.
+4. ✅ **EIP-170 margin — re-verified 2026-10-13; a standing gate, not a task.** Current
+   **1,342 B** (23,234 B runtime). The 2026-10-08 audit sweep spent 201 B and the 2026-10-12
+   attester-quorum fix 65 B on real fund-loss fixes, which is what margin is for. The
+   `optimizer_runs` table in `foundry.toml` was **re-measured on this build** (the 2026-10-02
+   numbers had gone stale by ~671 B after those fixes): 20 → 1 still buys **47 B** for ~1.2% gas,
+   and 999999 is still undeployable (−6,224 B). The verifier is a separate 3,816 B contract and
+   cost the token nothing. Enforced as a standing boundary in `AGENTS.md` ("Do not spend EIP-170
+   margin casually"), applied on every change rather than as a one-off item.
 5. ◑ **Out-of-field hash rate — integrator half CLOSED 2026-10-12.** Not a bug: refusing
    out-of-field hashes is required for soundness (reduce the hash and it collides with
    `hash - SNARK_FIELD`). But ~81% of `keccak256` outputs are above the prime, so a submitter

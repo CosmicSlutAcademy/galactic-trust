@@ -12,22 +12,26 @@ fs_permissions = [{ access = "read", path = "./test/fixtures"}]
 # `forge build --sizes`.
 optimizer = true
 
-# Measured 2026-10-02 across the settlement-heavy tests. The previous note here claimed high
-# turn counts were pinned "because higher values traded a few hundred bytes for a large gas
-# regression" — that regression does not exist. Lower `optimizer_runs` shrinks the bytecode and
-# costs a little gas, monotonically:
+# Measured 2026-10-02, re-measured 2026-10-13 on the post-audit-sweep build (23,234 B at the
+# chosen setting) — the 2026-10-02 table had gone stale after the fund-loss fixes added ~671 B.
+# The earlier note here claimed high turn counts were pinned "because higher values traded a few
+# hundred bytes for a large gas regression" — that regression does not exist. Lower
+# `optimizer_runs` shrinks the bytecode and costs a little gas, monotonically. Gas is a single
+# deterministic settlement benchmark (`test_UpheldDisputeSlashesStake`) so it is reproducible,
+# not an aggregate of unknown composition:
 #
-#   runs      runtime B   EIP-170 margin   settlement gas   vs 200
-#   1           22,516          2,060          7,241,474    +2.03%
-#   20          22,563          2,013          7,130,001    +0.46%   <-- chosen
-#   50          22,701          1,875          7,118,569    +0.30%
-#   100         22,794          1,782          7,111,924    +0.20%
-#   200         23,125          1,451          7,097,582    baseline
-#   999999      29,809         -5,233   UNDEPLOYABLE
+#   runs      runtime B   EIP-170 margin   benchmark gas
+#   1           23,187          1,389          625,784
+#   20          23,234          1,342          618,250   <-- chosen
+#   50          23,372          1,204          618,040
+#   100         23,465          1,111          617,335
+#   200         23,829            747          616,561
+#   999999      30,800         -6,224          615,140   UNDEPLOYABLE
 #
-# 20 takes ~95% of the available size win for ~23% of the gas cost; going 20 -> 1 buys 47 B
-# more for another 1.6% gas, which is a bad trade. EIP-170 is a hard deployability cliff and
-# gas is a soft recurring cost, so when the two conflict the cliff wins.
+# 20 takes ~93% of the available size win (200 -> 20 recovers 595 of the 642 B that 200 -> 1
+# does) for a ~0.3% gas premium over 200. Going 20 -> 1 buys 47 B more for another ~1.2% gas,
+# which is a bad trade. EIP-170 is a hard deployability cliff and gas is a soft recurring cost,
+# so when the two conflict the cliff wins.
 optimizer_runs = 20
 
 # Re-measured 2026-10-02 on the curator-bond build: via_ir produced 23,382 B runtime, 257 B
