@@ -1076,7 +1076,7 @@ legal-wrapper packages — closed 2026-10-13**, plus the curator bond and size r
    and 999999 is still undeployable (−6,224 B). The verifier is a separate 3,816 B contract and
    cost the token nothing. Enforced as a standing boundary in `AGENTS.md` ("Do not spend EIP-170
    margin casually"), applied on every change rather than as a one-off item.
-5. ◑ **Out-of-field hash rate — integrator half CLOSED 2026-10-12.** Not a bug: refusing
+5. ✅ **Out-of-field hash rate — CLOSED 2026-10-12.** Not a bug: refusing
    out-of-field hashes is required for soundness (reduce the hash and it collides with
    `hash - SNARK_FIELD`). But ~81% of `keccak256` outputs are above the prime, so a submitter
    who picks `contentHash` without checking silently never gets a machine verdict. The chosen
